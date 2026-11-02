@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "record": {
+    "id": "decision-guest-checkout",
+    "version": 2,
+    "kind": "decision",
+    "title": "Allow guest checkout.",
+    "statement": "Allow guest checkout.",
+    "rationale": "Customers abandon checkout when account creation is required.",
+    "review": "accepted",
+    "implementation": "planned",
+    "experiment_outcome": null,
+    "provenance": [
+      {
+        "source": "codex:guest-checkout-session",
+        "excerpt": "Customers abandon account creation during checkout."
+      }
+    ],
+    "evidence": [
+      "session:guest-checkout"
+    ],
+    "supersedes": null
+  }
+}
