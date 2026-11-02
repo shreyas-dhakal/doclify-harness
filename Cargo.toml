@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/doclify-domain"]
+resolver = "2"

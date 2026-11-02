@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "record": {
+    "id": "experiment-account-bypass",
+    "version": 1,
+    "kind": "experiment",
+    "title": "Bypass account creation in the checkout prototype.",
+    "statement": "Bypass account creation in the checkout prototype.",
+    "rationale": "Customers abandon checkout when account creation is required.",
+    "review": "proposed",
+    "implementation": "implemented",
+    "experiment_outcome": "abandoned",
+    "provenance": [
+      {
+        "source": "codex:guest-checkout-session",
+        "excerpt": "Customers abandon account creation during checkout."
+      }
+    ],
+    "evidence": [
+      "session:guest-checkout"
+    ],
+    "supersedes": null
+  }
+}

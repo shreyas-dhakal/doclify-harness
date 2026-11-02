@@ -1,0 +1,7 @@
+# Domain records
+
+`Store::open` takes a repository root and stores portable JSON under `.doclify/records/<id>/<version>.json`. Each version is immutable; proposals and explicit reviews append separate versions. `accepted` returns the latest accepted version even while a later proposal awaits review. Review state, implementation state, and experiment outcome are independent. Provenance can include a portable excerpt and evidence identifiers; callers must select excerpts carefully and must not copy raw transcripts or credentials by default.
+
+The file envelope has `schema_version: 1`. The reader migrates version 0 bare records in memory and rejects unknown versions; existing history is never rewritten. New versions use the current envelope. IDs are restricted to ASCII letters, digits, hyphens, and underscores. Writes use a synced temporary file and a no-overwrite hard link so concurrent writers cannot replace a version; a failed competing writer must reload and retry. The store requires a filesystem supporting hard links and directory synchronization. An incomplete temporary file is ignored on reads. Git merge conflicts in portable histories must be resolved by the user; the store detects gaps and path/identity mismatches rather than silently discarding history.
+
+The guest-checkout fixture is a synthetic repository with an accepted requirement and decision, a later proposed decision change, and an abandoned implemented experiment. It contains no real transcript.
