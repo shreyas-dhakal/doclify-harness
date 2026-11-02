@@ -1,0 +1,3 @@
+/target/
+# Captures, queues, and rebuildable indexes are local to each machine.
+.doclify/local/

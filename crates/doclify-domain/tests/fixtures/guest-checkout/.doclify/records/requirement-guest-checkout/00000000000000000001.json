@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "record": {
+    "id": "requirement-guest-checkout",
+    "version": 1,
+    "kind": "requirement",
+    "title": "Customers can check out without an account.",
+    "statement": "Customers can check out without an account.",
+    "rationale": "Customers abandon checkout when account creation is required.",
+    "review": "proposed",
+    "implementation": "partial",
+    "experiment_outcome": null,
+    "provenance": [
+      {
+        "source": "codex:guest-checkout-session",
+        "excerpt": "Customers abandon account creation during checkout."
+      }
+    ],
+    "evidence": [
+      "session:guest-checkout"
+    ],
+    "supersedes": null
+  }
+}
