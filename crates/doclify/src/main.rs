@@ -1,6 +1,6 @@
 use doclify_capture::queue::Queue;
 use doclify_capture::{hook, install, Agent, RepoInfo};
-use doclify_domain::{ReviewState, Store};
+use doclify_domain::{ImplementationState, Provenance, Record, RecordKind, ReviewState, Store};
 use doclify_model_bridge::{Bridge, Capability};
 use serde_json::{json, Value};
 use std::{
@@ -54,8 +54,7 @@ fn main() -> ExitCode {
                         .ok()
                         .and_then(|cwd| RepoInfo::discover(&cwd))
                     {
-                        let _ =
-                            fs::write(repo.git_dir.join("doclify/worker-error"), e.to_string());
+                        let _ = fs::write(repo.git_dir.join("doclify/worker-error"), e.to_string());
                     }
                     return ExitCode::FAILURE;
                 }
@@ -297,7 +296,10 @@ fn repl() -> ExitCode {
             continue;
         }
         if !line.starts_with('/') {
-            eprintln!("Documentation questions and edits require an inference integration; use /help for available commands.");
+            match documentation_request(line) {
+                Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
+                Err(e) => eprintln!("doclify: {e}"),
+            }
             continue;
         }
         let parts: Vec<String> = line[1..].split_whitespace().map(str::to_owned).collect();
@@ -320,8 +322,33 @@ fn repl() -> ExitCode {
                 }
             }
             println!("Search models by name; enter a number or exact name to select, or blank to cancel. API models can be configured with /model set.");
-            let choices = ["claude", "codex"];
-            let mut shown = choices.to_vec();
+            let repo = match std::env::current_dir()
+                .ok()
+                .and_then(|cwd| RepoInfo::discover(&cwd))
+            {
+                Some(repo) => repo,
+                None => {
+                    eprintln!("doclify: not inside a Git repository");
+                    continue;
+                }
+            };
+            let config = match load_config(&repo) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("doclify: {e}");
+                    continue;
+                }
+            };
+            let mut choices = vec!["claude".to_owned(), "codex".to_owned()];
+            if let Some(ref config) = config {
+                if matches!(config["provider"].as_str(), Some("openai" | "anthropic")) {
+                    match doclify::repl::discover_models(config) {
+                        Ok(models) => choices.extend(models),
+                        Err(e) => eprintln!("doclify: model discovery failed: {e}"),
+                    }
+                }
+            }
+            let mut shown = choices.clone();
             loop {
                 for (i, choice) in shown.iter().enumerate() {
                     println!("{}: {}", i + 1, choice);
@@ -340,25 +367,31 @@ fn repl() -> ExitCode {
                     .parse::<usize>()
                     .ok()
                     .and_then(|i| i.checked_sub(1))
-                    .and_then(|i| shown.get(i).copied())
+                    .and_then(|i| shown.get(i).cloned())
                     .or_else(|| {
                         choices
                             .iter()
-                            .copied()
                             .find(|name| name.eq_ignore_ascii_case(query))
+                            .cloned()
                     });
                 if let Some(choice) = selected {
-                    match run(&["model".into(), "set".into(), choice.into()]) {
+                    let result = if choice == "claude" || choice == "codex" {
+                        run(&["model".into(), "set".into(), choice])
+                    } else if let Some(mut selected) = config.clone() {
+                        selected["model"] = json!(choice);
+                        save_config(&repo, &selected)
+                            .map(|_| json!({"selected":selected,"authentication":"unverified"}))
+                            .map_err(Into::into)
+                    } else {
+                        Err("no API provider configured".into())
+                    };
+                    match result {
                         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
                         Err(e) => eprintln!("doclify: {e}"),
                     }
                     break;
                 }
-                shown = choices
-                    .iter()
-                    .copied()
-                    .filter(|name| name.contains(&query.to_lowercase()))
-                    .collect();
+                shown = doclify::repl::filter_models(&choices, query);
                 if shown.is_empty() {
                     println!("No matches; enter another search.");
                 }
@@ -372,6 +405,64 @@ fn repl() -> ExitCode {
     }
     let _ = stop.send(());
     ExitCode::SUCCESS
+}
+
+fn documentation_request(question: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let repo =
+        RepoInfo::discover(&std::env::current_dir()?).ok_or("not inside a Git repository")?;
+    let config = load_config(&repo)?.ok_or("select a model first with /model")?;
+    let scope = doclify_context::Scope {
+        branch: repo.branch.clone(),
+        topic: Some(question.into()),
+    };
+    let context = doclify_context::build(&repo.worktree, &scope, &Default::default())?;
+    let response = doclify::repl::request(
+        &config,
+        question,
+        context.as_ref().map(|c| c.render()).unwrap_or(""),
+    )?;
+    let store = Store::open(&repo.worktree)?;
+    let mut records = Vec::new();
+    for proposal in response.proposals {
+        let kind = match proposal.kind.as_str() {
+            "requirement" => RecordKind::Requirement,
+            "decision" => RecordKind::Decision,
+            "experiment" => RecordKind::Experiment,
+            "question" => RecordKind::Question,
+            "task" => RecordKind::Task,
+            _ => return Err("invalid proposal kind".into()),
+        };
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let id = format!(
+            "request-{}-{}-{}",
+            timestamp,
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let record = Record {
+            id,
+            version: 1,
+            kind,
+            title: proposal.summary.clone(),
+            statement: proposal.summary,
+            rationale: String::new(),
+            review: ReviewState::Proposed,
+            implementation: ImplementationState::Unknown,
+            experiment_outcome: None,
+            provenance: vec![Provenance {
+                source: "interactive-documentation-request".into(),
+                excerpt: Some(question.into()),
+            }],
+            evidence: proposal.evidence,
+            supersedes: None,
+        };
+        store.propose(&record)?;
+        records.push(record);
+    }
+    Ok(json!({"answer":response.answer,"proposals":records}))
 }
 
 fn config_path(repo: &RepoInfo) -> std::path::PathBuf {

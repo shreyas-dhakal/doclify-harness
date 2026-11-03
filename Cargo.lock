@@ -402,6 +402,7 @@ name = "doclify-viewer"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "cap-std",
  "doclify-domain",
  "http-body-util",
  "mime_guess",
