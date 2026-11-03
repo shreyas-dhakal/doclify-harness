@@ -1,0 +1,13 @@
+[package]
+name = "doclify-evidence"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only Git/GitHub evidence sync and standard documentation generation for Doclify"
+
+[dependencies]
+doclify-domain = { path = "../doclify-domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
