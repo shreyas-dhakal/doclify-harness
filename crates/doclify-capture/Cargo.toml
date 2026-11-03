@@ -8,6 +8,8 @@ description = "Codex and Claude Code hook capture, hook installation, and transc
 doclify-context = { path = "../doclify-context" }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+cap-std = "3"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

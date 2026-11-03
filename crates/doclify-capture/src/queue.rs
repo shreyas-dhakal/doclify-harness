@@ -1,5 +1,5 @@
 //! Local durable jobs, hook queue draining, and transcript checkpoints.
-//! Callers must serialize workers for a repository; hooks may enqueue concurrently.
+//! Workers can lock the queue across a complete iteration.
 use crate::{hook, transcript, Agent};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,17 @@ impl Queue {
     /// Reconcile one hook event. Unknown formats return an error without advancing
     /// the checkpoint. Raw events are kept locally, including on error.
     pub fn reconcile(&self, event: &Value) -> io::Result<()> {
+        self.reconcile_with_roots(event, &[])
+    }
+    pub fn reconcile_with_roots(&self, event: &Value, roots: &[&Path]) -> io::Result<()> {
+        self.reconcile_snapshot(event, roots, None)
+    }
+    pub fn reconcile_snapshot(
+        &self,
+        event: &Value,
+        roots: &[&Path],
+        snapshot: Option<&[u8]>,
+    ) -> io::Result<()> {
         let agent_name = event["agent"]
             .as_str()
             .ok_or_else(|| invalid("missing agent"))?;
@@ -56,7 +67,30 @@ impl Queue {
         let session = payload["session_id"]
             .as_str()
             .ok_or_else(|| invalid("transcript event missing session_id"))?;
-        let bytes = fs::read(path)?;
+        let path_obj = Path::new(path);
+        let mut authorized = None;
+        for root in roots {
+            if let Ok(relative) = path_obj.strip_prefix(root) {
+                let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+                match dir.read(relative) {
+                    Ok(bytes) => {
+                        if snapshot.is_some_and(|s| s != bytes) {
+                            return Err(invalid("transcript changed during discovery"));
+                        }
+                        authorized = Some(bytes);
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        let bytes = authorized.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "transcript outside authorized roots",
+            )
+        })?;
         let key = digest(format!("{agent_name}\0{session}\0{path}").as_bytes());
         let cp_path = self.root.join("checkpoints").join(key);
         let checkpoint: Option<Value> = match fs::read(&cp_path) {
@@ -72,7 +106,7 @@ impl Queue {
                 .then_some(n as u64)
             })
             .unwrap_or(0);
-        let read = transcript::read(agent, Path::new(path), offset)?;
+        let read = transcript::read_from(agent, std::io::Cursor::new(&bytes), offset)?;
         if !read.unsupported.is_empty() {
             return Err(invalid(format!(
                 "unsupported transcript {path}: {}",
@@ -101,14 +135,26 @@ impl Queue {
     }
     /// Drain hook files only after their events and transcript jobs are durable.
     pub fn drain_hooks(&self, hook_dir: &Path) -> io::Result<usize> {
+        self.drain_hooks_with_roots(hook_dir, &[])
+    }
+    pub fn drain_hooks_with_roots(&self, hook_dir: &Path, roots: &[&Path]) -> io::Result<usize> {
         let mut count = 0;
         for (path, event) in hook::pending(hook_dir)? {
-            self.reconcile(&event)?;
+            self.reconcile_with_roots(&event, roots)?;
             fs::remove_file(path)?;
             fs::File::open(hook_dir)?.sync_all()?;
             count += 1;
         }
         Ok(count)
+    }
+    pub fn lock(&self) -> io::Result<fs::File> {
+        use fs2::FileExt;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.root.join(".worker.lock"))?;
+        file.lock_exclusive()?;
+        Ok(file)
     }
     pub fn pending(&self) -> io::Result<Vec<(String, Value)>> {
         let mut paths = fs::read_dir(self.root.join("pending"))?
@@ -144,10 +190,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
