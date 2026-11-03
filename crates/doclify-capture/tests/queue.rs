@@ -125,3 +125,13 @@ fn changed_discovery_snapshot_is_not_processed() {
         .is_err());
     assert!(queue.pending().unwrap().is_empty());
 }
+
+#[test]
+fn tool_results_are_retained_without_creating_proposal_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Queue::open(dir.path()).unwrap();
+    let event = serde_json::json!({"agent":"claude","payload":{"hook_event_name":"PostToolUse","tool_input":{"command":"cargo test"}}});
+    queue.reconcile(&event).unwrap();
+    assert!(queue.pending().unwrap().is_empty());
+    assert_eq!(fs::read_dir(dir.path().join("events")).unwrap().count(), 1);
+}

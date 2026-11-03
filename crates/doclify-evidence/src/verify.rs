@@ -27,8 +27,11 @@ pub struct TestRun {
     pub outcome: TestOutcome,
     pub agent: String,
     pub session: String,
-    /// HEAD when captured. Uncommitted working-tree changes are not captured.
+    /// HEAD when captured.
     pub revision: Option<String>,
+    /// Whether relevant working-tree changes were present at capture.
+    #[serde(default)]
+    pub worktree_dirty: Option<bool>,
     pub observed_at_ms: u64,
     /// Exactly what was verified: the command run, or the claim's text.
     /// Never implies coverage beyond it.
@@ -113,6 +116,7 @@ fn test_run(v: &Value) -> Option<TestRun> {
         agent: env["agent"].as_str().unwrap_or("unknown").into(),
         session: session_of(env, job).into(),
         revision: env["head"].as_str().map(Into::into),
+        worktree_dirty: env["worktree_dirty"].as_bool(),
         observed_at_ms: env["received_at_ms"].as_u64().unwrap_or_default(),
         scope,
         stale: None,
@@ -152,6 +156,7 @@ fn excerpt(text: &str, at: usize) -> String {
 // ponytail: any non-doc change counts as relevant; map test scope to paths if this is too noisy.
 pub fn mark_stale(repo: &Path, head: Option<&str>, runs: &mut [TestRun]) {
     let mut cache: HashMap<String, Option<String>> = HashMap::new();
+    let current_dirty = worktree_dirty(repo);
     for run in runs {
         run.stale = match (&run.revision, head) {
             (None, _) => Some("revision not captured".into()),
@@ -161,13 +166,28 @@ pub fn mark_stale(repo: &Path, head: Option<&str>, runs: &mut [TestRun]) {
                 .or_insert_with(|| changed_since(repo, rev, head))
                 .clone(),
         };
+        if run.stale.is_none() {
+            run.stale = match (run.worktree_dirty, current_dirty) {
+                (Some(true), _) => Some("working tree was dirty at capture".into()),
+                (None, _) => Some("working tree state not captured".into()),
+                (_, Some(true)) => Some("working tree has uncommitted changes".into()),
+                (_, None) => Some("working tree state unavailable".into()),
+                _ => None,
+            };
+        }
     }
+}
+fn worktree_dirty(repo: &Path) -> Option<bool> {
+    let out = std::process::Command::new("git").current_dir(repo)
+        .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify", ":(exclude).claude/settings.local.json", ":(exclude).codex/hooks.json"])
+        .output().ok()?;
+    out.status.success().then(|| !out.stdout.is_empty())
 }
 fn changed_since(repo: &Path, rev: &str, head: &str) -> Option<String> {
     if rev.starts_with('-') {
         return Some("invalid revision".into());
     }
-    match crate::git(repo, &["diff", "--name-only", rev, head, "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify"]) {
+    match crate::git(repo, &["diff", "--name-only", rev, head, "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify", ":(exclude).claude/settings.local.json", ":(exclude).codex/hooks.json"]) {
         Err(_) => Some(format!("revision {} not found locally", short(rev))),
         Ok(out) => match out.lines().count() {
             0 => None,

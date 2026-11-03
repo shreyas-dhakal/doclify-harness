@@ -66,6 +66,9 @@ impl Queue {
         }
         let Some(path) = payload["transcript_path"].as_str() else {
             atomic_write(&self.root.join("events").join(&event_id), &raw)?;
+            if matches!(payload["hook_event_name"].as_str(), Some("PostToolUse" | "PostToolUseFailure")) {
+                return Ok(());
+            }
             return self.enqueue(&event_id, &json!({"source":"hook", "event":event}));
         };
         let session = payload["session_id"]

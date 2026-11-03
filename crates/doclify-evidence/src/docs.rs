@@ -333,7 +333,7 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
     );
     s.push_str(
         "\n## Test evidence\n\nObserved runs were seen through tool hooks; claims are what an agent said and were not observed. \
-         Each result covers only its command at its revision; uncommitted changes were not captured.\n\n",
+         Each result covers only its command and captured state; dirty or unknown working trees are marked stale.\n\n",
     );
     list(
         &mut s,

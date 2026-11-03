@@ -17,7 +17,7 @@ use crate::{Agent, RepoInfo};
 pub const MARKER: &str = ": doclify-hook=1;";
 /// Command the hooks invoke; resolved via PATH so the Codex file stays portable.
 pub const DEFAULT_EXE: &str = "doclify-capture";
-const EVENTS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop"];
+const EVENTS: [&str; 6] = ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop", "PostToolUse", "PostToolUseFailure"];
 const TIMEOUT_SECS: u64 = 5;
 
 pub fn config_path(worktree: &Path, agent: Agent) -> PathBuf {
@@ -180,6 +180,8 @@ mod tests {
         assert_eq!(start.len(), 2, "existing group kept, ours added once");
         assert_eq!(start[0]["hooks"][0]["command"], "orca-hook");
         assert_eq!(root["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(root["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(root["hooks"]["PostToolUseFailure"].as_array().unwrap().len(), 1);
 
         remove_ours(&mut root);
         // Pre-existing empty event arrays are user state and survive.

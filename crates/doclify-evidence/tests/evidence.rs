@@ -240,7 +240,7 @@ fn preexisting_human_page_is_not_overwritten() {
 fn event(agent: &str, session: &str, head: &str, at: u64, payload: Value) -> Value {
     let mut payload = payload;
     payload["session_id"] = json!(session);
-    json!({"schema": 1, "agent": agent, "received_at_ms": at, "head": head, "payload": payload})
+    json!({"schema": 1, "agent": agent, "received_at_ms": at, "head": head, "worktree_dirty": false, "payload": payload})
 }
 fn tool(command: Value, response: Value) -> Value {
     json!({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": command}, "tool_response": response})
@@ -397,4 +397,20 @@ fn provenance_links_to_portable_record_with_excerpt_in_clone() {
     copy_dir(dir.path(), clone.path());
     let source = fs::read_to_string(clone.path().join("docs/doclify").join(link)).unwrap();
     assert!(source.contains("Customers abandon account creation"));
+}
+
+#[test]
+fn dirty_capture_and_current_changes_are_not_fresh() {
+    let dir = fixture_repo();
+    let repo = dir.path();
+    let head = git(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut captured = vec![event("claude", "dirty", &head, 1, tool(json!("cargo test"), json!({})))];
+    captured[0]["worktree_dirty"] = json!(true);
+    let options = SyncOptions { gh: None, captured: &captured, ..Default::default() };
+    let e = sync(repo, &repo.join(".git/doclify"), &options).unwrap();
+    assert!(e.tests[0].stale.as_deref().unwrap().contains("dirty"));
+    captured[0]["worktree_dirty"] = json!(false);
+    fs::write(repo.join("new.rs"), "new").unwrap();
+    let e = sync(repo, &repo.join(".git/doclify"), &SyncOptions { gh: None, captured: &captured, ..Default::default() }).unwrap();
+    assert!(e.tests[0].stale.as_deref().unwrap().contains("working tree"));
 }

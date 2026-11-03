@@ -94,6 +94,7 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
         "worktree": repo.worktree,
         "branch": repo.branch,
         "head": repo.head,
+        "worktree_dirty": worktree_dirty(&repo.worktree),
         "payload": payload,
     });
     // Unique and time-sortable; write-then-rename so readers never see partial files.
@@ -136,4 +137,13 @@ pub fn pending(queue_dir: &Path) -> io::Result<Vec<(PathBuf, Value)>> {
             Ok((p, value))
         })
         .collect()
+}
+
+/// Whether relevant tracked or untracked files differ from HEAD. Unknown on Git failure.
+pub fn worktree_dirty(repo: &Path) -> Option<bool> {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify", ":(exclude).claude/settings.local.json", ":(exclude).codex/hooks.json"])
+        .output().ok()?;
+    out.status.success().then(|| !out.stdout.is_empty())
 }

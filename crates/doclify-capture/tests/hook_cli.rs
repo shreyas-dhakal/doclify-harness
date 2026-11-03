@@ -266,3 +266,14 @@ fn linked_worktree_inherits_registration_and_reviewed_context_without_leaking() 
     fs::remove_dir_all(&dir).unwrap();
     fs::remove_dir_all(wt).unwrap();
 }
+
+#[test]
+fn tool_hook_captures_dirty_worktree_state() {
+    let dir = git_repo("dirty-state");
+    let info = RepoInfo::discover(&dir).unwrap();
+    doclify_capture::install::install(&info, "doclify-capture").unwrap();
+    fs::write(dir.join("changed.rs"), "changed").unwrap();
+    run_hook(&dir, "claude", r#"{"hook_event_name":"PostToolUse","tool_input":{"command":"cargo test"}}"#, &[]);
+    let events = hook::pending(&info.queue_dir()).unwrap();
+    assert_eq!(events[0].1["worktree_dirty"], true);
+}

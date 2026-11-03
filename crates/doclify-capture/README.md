@@ -6,10 +6,10 @@ CLI versions inspected during development: Codex 0.166.0 and Claude Code 2.1.308
 
 ## How it works
 
-- `doclify-capture install` (inside a repo) creates `<git-dir>/doclify/queue/` (this marks that worktree as registered and is never tracked) and adds hooks for `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` to:
+- `doclify-capture install` (inside a repo) creates `<git-dir>/doclify/queue/` (this marks that worktree as registered and is never tracked) and adds hooks for `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `PostToolUse`, `PostToolUseFailure` to:
   - Claude: `.claude/settings.local.json` (personal, not committed)
   - Codex: `.codex/hooks.json` (project hooks)
-- Each hook runs `doclify-capture hook <agent>`, which writes one JSON file per event (`{schema, agent, received_at_ms, worktree, branch, head, payload}`) via write-then-rename. On `SessionStart` (startup, resume, clear, compact) the hook also prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":…}}` built from `.doclify/records` by `doclify-context`; every other event prints nothing. The exit status is always 0, and no model is called. A missing binary is absorbed by the shell wrapper.
+- Each hook runs `doclify-capture hook <agent>`, which writes one JSON file per event (`{schema, agent, received_at_ms, worktree, branch, head, worktree_dirty, payload}`) via write-then-rename. On `SessionStart` (startup, resume, clear, compact) the hook also prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":…}}` built from `.doclify/records` by `doclify-context`; every other event prints nothing. The exit status is always 0, and no model is called. A missing binary is absorbed by the shell wrapper.
 - Hooks exit immediately when `DOCLIFY_BRIDGE` is set. Doclify **must** set it on every `codex exec` / `claude -p` bridge process.
 - `uninstall` removes only handlers whose command starts with `: doclify-hook=1;`, plus groups/events/`hooks` it emptied.
 - `transcript::read(agent, path, offset)` returns entries (User/Assistant/ToolCall/ToolResult/SessionMeta with stable ids), the next offset, and an `unsupported` list. Partial trailing lines are deferred. A file that shrank is re-read from 0; ids make the replay idempotent.
