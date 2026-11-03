@@ -25,7 +25,7 @@ const EVENTS: [&str; 6] = ["SessionStart", "UserPromptSubmit", "Stop", "Subagent
 const TIMEOUT_SECS: u64 = 5;
 const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
 /// Per-worktree opt-out, under that worktree's own Git directory.
-const OPT_OUT: &str = "doclify/hooks-uninstalled";
+const OPT_OUT: &str = "doclify/disabled";
 
 pub fn config_path(worktree: &Path, agent: Agent) -> PathBuf {
     match agent {
@@ -120,10 +120,6 @@ pub fn uninstall(repo: &RepoInfo) -> io::Result<Vec<PathBuf>> {
         if path.exists() && edit(&path, remove_ours)? {
             changed.push(path);
         }
-    }
-    if let Some(repo) = RepoInfo::discover(worktree) {
-        fs::create_dir_all(repo.git_dir.join("doclify"))?;
-        fs::write(repo.git_dir.join("doclify/disabled"), b"disabled\n")?;
     }
     Ok(changed)
 }
