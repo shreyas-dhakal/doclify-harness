@@ -277,3 +277,120 @@ fn tool_hook_captures_dirty_worktree_state() {
     let events = hook::pending(&info.queue_dir()).unwrap();
     assert_eq!(events[0].1["worktree_dirty"], true);
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    assert!(Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn capture(dir: &Path, cmd: &str) {
+    assert!(Command::new(BIN)
+        .arg(cmd)
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn ours(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .matches(doclify_capture::install::MARKER)
+        .count()
+}
+
+#[test]
+fn hooks_reach_existing_and_new_worktrees_without_touching_foreign_state() {
+    use doclify_capture::{install::config_path, Agent};
+    let dir = git_repo("reconcile");
+    git(&dir, &["commit", "--allow-empty", "-qm", "initial"]);
+    let wt = |name: &str| dir.with_extension(name);
+    let add = |name: &str| {
+        let _ = fs::remove_dir_all(wt(name));
+        git(
+            &dir,
+            &["worktree", "add", "-qb", name, wt(name).to_str().unwrap()],
+        );
+    };
+    let foreign = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"theirs"}]}]}}"#;
+    let codex = |name: &str| config_path(&wt(name), Agent::Codex);
+    let claude = |name: &str| config_path(&wt(name), Agent::Claude);
+
+    // Existing worktrees: one with a foreign Codex hook, one with a broken file,
+    // one whose directory has gone (prunable).
+    add("existing");
+    fs::create_dir_all(codex("existing").parent().unwrap()).unwrap();
+    fs::write(codex("existing"), foreign).unwrap();
+    add("broken");
+    fs::create_dir_all(claude("broken").parent().unwrap()).unwrap();
+    fs::write(claude("broken"), "{ not json").unwrap();
+    add("gone");
+    fs::remove_dir_all(wt("gone")).unwrap();
+
+    capture(&dir, "install");
+    for name in ["existing", "broken"] {
+        assert_eq!(ours(&codex(name)), 4, "{name}");
+    }
+    assert_eq!(ours(&claude("existing")), 4);
+    assert!(fs::read_to_string(codex("existing"))
+        .unwrap()
+        .contains("theirs"));
+    assert_eq!(fs::read_to_string(claude("broken")).unwrap(), "{ not json");
+    assert!(!wt("gone").exists(), "missing worktrees are not recreated");
+
+    // A worktree added later gets hooks when a session starts anywhere,
+    // and that start stays silent although one worktree's file is broken.
+    add("later");
+    assert!(!claude("later").exists());
+    let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
+    let out = run_hook(&dir, "claude", start, &[]);
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+    assert_eq!((ours(&claude("later")), ours(&codex("later"))), (4, 4));
+    let before = fs::read_to_string(claude("later")).unwrap();
+    run_hook(&dir, "claude", start, &[]);
+    assert_eq!(
+        fs::read_to_string(claude("later")).unwrap(),
+        before,
+        "idempotent"
+    );
+
+    // Uninstall restores the foreign config and is not undone by reconciliation.
+    capture(&wt("existing"), "uninstall");
+    let restored = |p: PathBuf| {
+        fs::read_to_string(p)
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>()
+    };
+    assert_eq!(restored(codex("existing")), foreign);
+    run_hook(&wt("later"), "codex", start, &[]);
+    assert_eq!(ours(&codex("existing")), 0);
+    assert_eq!(ours(&codex("later")), 4, "other worktrees keep their hooks");
+    capture(&wt("existing"), "install");
+    assert_eq!(ours(&codex("existing")), 4, "install lifts the opt-out");
+
+    git(&dir, &["worktree", "prune"]);
+    for name in ["existing", "broken", "later"] {
+        fs::remove_dir_all(wt(name)).unwrap();
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unregistered_repo_worktrees_get_no_hooks() {
+    let dir = git_repo("reconcile-unregistered");
+    git(&dir, &["commit", "--allow-empty", "-qm", "initial"]);
+    let wt = dir.with_extension("unreg-wt");
+    let _ = fs::remove_dir_all(&wt);
+    git(&dir, &["worktree", "add", "-qb", "x", wt.to_str().unwrap()]);
+    let out = run_hook(&dir, "claude", r#"{"hook_event_name":"SessionStart"}"#, &[]);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(!wt.join(".claude").exists() && !dir.join(".claude").exists());
+    fs::remove_dir_all(&wt).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -29,8 +29,25 @@ pub fn run(agent: Agent) -> io::Result<Option<PathBuf>> {
     let queued = enqueue(agent, &raw, &cwd);
     if let Some(out) = session_context(&raw, &cwd) {
         let _ = io::stdout().write_all(out.as_bytes());
+        let _ = io::stdout().flush();
     }
+    reconcile_on_start(&raw, &cwd);
     queued
+}
+
+/// Worktrees added after `install` get hooks the next time a session starts
+/// anywhere in the repository. Silent and best-effort, like the rest of the hook.
+fn reconcile_on_start(raw: &[u8], fallback_cwd: &Path) {
+    let Ok(payload) = serde_json::from_slice::<Value>(raw) else {
+        return;
+    };
+    if payload["hook_event_name"] != "SessionStart" {
+        return;
+    }
+    let cwd = payload["cwd"].as_str().map_or(fallback_cwd, Path::new);
+    if let Some(repo) = RepoInfo::discover(cwd) {
+        crate::install::reconcile(&repo);
+    }
 }
 
 /// SessionStart (startup, resume, clear, compact) gets bounded context from

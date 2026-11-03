@@ -112,18 +112,27 @@ impl RepoInfo {
 
     /// Primary worktree, used as a fallback for reviewed repository context.
     pub fn primary_worktree(&self) -> Option<PathBuf> {
-        let out = Command::new("git")
+        self.worktrees().into_iter().next()
+    }
+
+    /// Every worktree Git lists, primary first. Bare and missing entries are
+    /// included; callers check the path before using it.
+    pub fn worktrees(&self) -> Vec<PathBuf> {
+        let Ok(out) = Command::new("git")
             .arg("-C")
             .arg(&self.worktree)
-            .args(["worktree", "list", "--porcelain"])
+            .args(["worktree", "list", "--porcelain", "-z"])
             .output()
-            .ok()?;
+        else {
+            return Vec::new();
+        };
         if !out.status.success() {
-            return None;
+            return Vec::new();
         }
-        let text = String::from_utf8(out.stdout).ok()?;
-        text.lines()
-            .find_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+            .collect()
     }
 
     /// Capture queues remain local to each worktree for attribution and recovery.

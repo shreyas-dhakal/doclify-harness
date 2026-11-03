@@ -115,10 +115,11 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             )
         }
         ["uninstall"] => {
-            let removed = install::uninstall(&repo.worktree)?;
+            let removed = install::uninstall(&repo)?;
             recovery::uninstall(&repo)?;
             Ok(json!({"removed":removed}))
         }
+
         ["status"] => {
             let queue = Queue::open(repo.git_dir.join("doclify/jobs"))?;
             let count = if repo.queue_dir().is_dir() {

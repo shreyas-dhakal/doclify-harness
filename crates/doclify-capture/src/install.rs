@@ -5,6 +5,10 @@
 //! - Codex: `<worktree>/.codex/hooks.json`. Codex only runs project hooks for a
 //!   trusted project after the user reviews them in `/hooks`; we never write
 //!   trust state on the user's behalf.
+//!
+//! Registration is shared by linked worktrees, so `reconcile` copies the
+//! installed command into worktrees that lack it, including ones created after
+//! `install`. A worktree that ran `uninstall` opts out until `install` runs there.
 
 use std::fs;
 use std::io;
@@ -19,6 +23,9 @@ pub const MARKER: &str = ": doclify-hook=1;";
 pub const DEFAULT_EXE: &str = "doclify-capture";
 const EVENTS: [&str; 6] = ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop", "PostToolUse", "PostToolUseFailure"];
 const TIMEOUT_SECS: u64 = 5;
+const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
+/// Per-worktree opt-out, under that worktree's own Git directory.
+const OPT_OUT: &str = "doclify/hooks-uninstalled";
 
 pub fn config_path(worktree: &Path, agent: Agent) -> PathBuf {
     match agent {
@@ -37,16 +44,17 @@ pub fn hook_command(exe: &str, agent: Agent) -> String {
     )
 }
 
-/// Registers the repository for capture and installs both agents' hooks.
+/// Registers the repository for capture, installs both agents' hooks here, and
+/// reconciles the repository's other worktrees.
 pub fn install(repo: &RepoInfo, exe: &str) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(repo.common_dir.join("doclify/queue"))?;
     fs::create_dir_all(repo.queue_dir())?;
-    match fs::remove_file(repo.git_dir.join("doclify/disabled")) {
-        Ok(()) => (),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e),
+    match fs::remove_file(repo.git_dir.join(OPT_OUT)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
     }
-    [Agent::Claude, Agent::Codex]
+    let mut paths = AGENTS
+
         .into_iter()
         .map(|agent| {
             let path = config_path(&repo.worktree, agent);
@@ -56,14 +64,59 @@ pub fn install(repo: &RepoInfo, exe: &str) -> io::Result<Vec<PathBuf>> {
             })?;
             Ok(path)
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    paths.extend(reconcile(repo));
+    Ok(paths)
 }
 
-/// Removes only Doclify's entries. Captured data in the queue is left alone.
-pub fn uninstall(worktree: &Path) -> io::Result<Vec<PathBuf>> {
+/// Adds Doclify's hooks to every worktree of a registered repository that has
+/// none, using the command already installed in another worktree. Opted-out,
+/// bare, and missing worktrees and unparseable files are skipped; existing
+/// entries are never rewritten. Returns the files changed.
+pub fn reconcile(repo: &RepoInfo) -> Vec<PathBuf> {
+    if !repo.registered() {
+        return Vec::new();
+    }
+    let worktrees: Vec<PathBuf> = repo
+        .worktrees()
+        .into_iter()
+        .filter(|wt| git_dir(wt).is_some_and(|d| !d.join(OPT_OUT).exists()))
+        .collect();
     let mut changed = Vec::new();
-    for agent in [Agent::Claude, Agent::Codex] {
-        let path = config_path(worktree, agent);
+    for agent in AGENTS {
+        let Some(command) = worktrees.iter().find_map(|wt| {
+            let text = fs::read_to_string(config_path(wt, agent)).ok()?;
+            let root: Map<String, Value> = serde_json::from_str(&text).ok()?;
+            our_command(&root).map(str::to_owned)
+        }) else {
+            continue;
+        };
+        for wt in &worktrees {
+            let path = config_path(wt, agent);
+            let added = edit(&path, |root| {
+                if our_command(root).is_none() {
+                    add_ours(root, &command);
+                }
+            });
+            if added.unwrap_or(false) {
+                changed.push(path);
+            }
+        }
+    }
+    changed
+}
+
+/// Removes only Doclify's entries in this worktree and opts it out of
+/// `reconcile`. Captured data in the queue is left alone.
+pub fn uninstall(repo: &RepoInfo) -> io::Result<Vec<PathBuf>> {
+    if repo.registered() {
+        let marker = repo.git_dir.join(OPT_OUT);
+        fs::create_dir_all(marker.parent().unwrap())?;
+        fs::write(marker, "")?;
+    }
+    let mut changed = Vec::new();
+    for agent in AGENTS {
+        let path = config_path(&repo.worktree, agent);
         if path.exists() && edit(&path, remove_ours)? {
             changed.push(path);
         }
@@ -73,6 +126,18 @@ pub fn uninstall(worktree: &Path) -> io::Result<Vec<PathBuf>> {
         fs::write(repo.git_dir.join("doclify/disabled"), b"disabled\n")?;
     }
     Ok(changed)
+}
+
+/// A worktree's Git directory: `.git` itself, or the `gitdir:` a linked
+/// worktree's `.git` file points at. `None` for bare or missing worktrees.
+fn git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = fs::read_to_string(&dot_git).ok()?;
+    let dir = worktree.join(text.strip_prefix("gitdir:")?.trim());
+    dir.is_dir().then_some(dir)
 }
 
 /// Read-modify-write that refuses to touch unparseable files and replaces
@@ -121,6 +186,18 @@ fn add_ours(root: &mut Map<String, Value>, command: &str) {
             }));
         }
     }
+}
+
+fn our_command(root: &Map<String, Value>) -> Option<&str> {
+    root.get("hooks")?
+        .as_object()?
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group["hooks"].as_array())
+        .flatten()
+        .find(|h| is_ours(h))?["command"]
+        .as_str()
 }
 
 fn is_ours(handler: &Value) -> bool {

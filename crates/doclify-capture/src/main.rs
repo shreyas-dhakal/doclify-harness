@@ -27,7 +27,7 @@ fn main() -> ExitCode {
             };
             report(repo().and_then(|r| install::install(&r, exe)), true)
         }
-        ["uninstall"] => report(repo().and_then(|r| install::uninstall(&r.worktree)), false),
+        ["uninstall"] => report(repo().and_then(|r| install::uninstall(&r)), false),
         _ => usage(),
     }
 }
@@ -41,7 +41,11 @@ fn report(result: std::io::Result<Vec<std::path::PathBuf>>, installed: bool) -> 
     match result {
         Ok(paths) => {
             for p in paths {
-                println!("{} {}", if installed { "installed" } else { "removed" }, p.display());
+                println!(
+                    "{} {}",
+                    if installed { "installed" } else { "removed" },
+                    p.display()
+                );
             }
             if installed {
                 println!("Codex: trust this project and approve the new hooks in Codex's /hooks view; until then Codex capture is inactive.");
