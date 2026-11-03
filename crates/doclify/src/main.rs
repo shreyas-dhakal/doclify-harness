@@ -53,7 +53,11 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
         ["uninstall"] => Ok(json!({"removed":install::uninstall(&repo.worktree)?})),
         ["status"] => {
             let queue = Queue::open(repo.common_dir.join("doclify/jobs"))?;
-            let count = hook::pending(&repo.queue_dir())?.len();
+            let count = if repo.queue_dir().is_dir() {
+                hook::pending(&repo.queue_dir())?.len()
+            } else {
+                0
+            };
             let store = Store::open(&repo.worktree)?;
             let mut pending = Vec::new();
             for id in ids(&repo)? {
@@ -91,6 +95,17 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
         {
             if model.trim().is_empty() || key_env.trim().is_empty() {
                 return Err("model and credential environment variable are required".into());
+            }
+            let parsed = url::Url::parse(url).map_err(|_| "invalid provider URL")?;
+            if !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || !(parsed.scheme() == "https"
+                    || (parsed.scheme() == "http"
+                        && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))))
+            {
+                return Err("provider URL must use HTTPS or loopback HTTP and contain no credentials, query, or fragment".into());
             }
             let selected =
                 json!({"provider":provider,"base_url":url,"api_key_env":key_env,"model":model});
