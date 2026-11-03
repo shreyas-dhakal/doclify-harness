@@ -374,3 +374,152 @@ fn imported_proposal_preserves_supported_details() {
         doclify_domain::ImplementationState::Partial
     );
 }
+
+#[test]
+fn revisions_require_review_and_preserve_history_across_sessions() {
+    use doclify_domain::{ImplementationState, ReviewState};
+    struct Revision {
+        target: Option<(String, u64)>,
+        text: &'static str,
+        implementation: &'static str,
+    }
+    impl Extractor for Revision {
+        fn extract(&mut self, event: &Value) -> io::Result<Value> {
+            if let Some((id, version)) = &self.target {
+                assert!(event["existing_records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["id"] == *id && r["version"] == *version));
+            }
+            Ok(
+                serde_json::json!({"proposals":[{"kind":"decision","summary":self.text,"review":"proposed","evidence":[event["source_id"]],"existing_record":self.target.as_ref().map(|(id,version)| serde_json::json!({"id":id,"version":version})),"implementation":self.implementation}]}),
+            )
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    let store = doclify_domain::Store::open(dir.path()).unwrap();
+    let out = dir.path().join("out");
+    let enqueue = |session: &str| {
+        queue
+            .reconcile(&serde_json::json!({"agent":"codex","payload":{"session_id":session}}))
+            .unwrap();
+    };
+    enqueue("one");
+    let id = format!("capture-{}-0", queue.pending().unwrap()[0].0);
+    doclify_pipeline::process_proposals(
+        &queue,
+        &out,
+        &store,
+        &mut Revision {
+            target: None,
+            text: "Allow guests",
+            implementation: "planned",
+        },
+    )
+    .unwrap();
+    let first = store.review(&id, 1, ReviewState::Accepted).unwrap();
+    enqueue("two");
+    doclify_pipeline::process_proposals(
+        &queue,
+        &out,
+        &store,
+        &mut Revision {
+            target: Some((id.clone(), 2)),
+            text: "Require accounts",
+            implementation: "implemented",
+        },
+    )
+    .unwrap();
+    assert_eq!(store.accepted(&id).unwrap(), Some(first.clone()));
+    assert_eq!(store.history(&id).unwrap()[2].supersedes, Some(2));
+    store.review(&id, 3, ReviewState::Rejected).unwrap();
+    assert_eq!(store.accepted(&id).unwrap(), Some(first));
+    enqueue("three");
+    doclify_pipeline::process_proposals(
+        &queue,
+        &out,
+        &store,
+        &mut Revision {
+            target: Some((id.clone(), 4)),
+            text: "Require accounts",
+            implementation: "implemented",
+        },
+    )
+    .unwrap();
+    let accepted = store.review(&id, 5, ReviewState::Accepted).unwrap();
+    assert_eq!(store.accepted(&id).unwrap(), Some(accepted));
+    enqueue("four");
+    doclify_pipeline::process_proposals(
+        &queue,
+        &out,
+        &store,
+        &mut Revision {
+            target: Some((id.clone(), 6)),
+            text: "Allow guests again",
+            implementation: "reverted",
+        },
+    )
+    .unwrap();
+    let reverted = store.review(&id, 7, ReviewState::Accepted).unwrap();
+    assert_eq!(reverted.implementation, ImplementationState::Reverted);
+    assert_eq!(store.history(&id).unwrap().len(), 8);
+}
+
+#[test]
+fn unknown_revision_and_invented_excerpt_are_rejected_without_caching() {
+    struct Bad {
+        invented_excerpt: bool,
+    }
+    impl Extractor for Bad {
+        fn extract(&mut self, event: &Value) -> io::Result<Value> {
+            Ok(
+                serde_json::json!({"proposals":[{"kind":"decision","summary":"Change","review":"proposed","evidence":[event["source_id"]],"existing_record":if self.invented_excerpt { None } else { Some(serde_json::json!({"id":"missing","version":1})) },"excerpt":if self.invented_excerpt { Some("invented words") } else { None }}]}),
+            )
+        }
+    }
+    for invented_excerpt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::open(dir.path().join("q")).unwrap();
+        queue
+            .reconcile(&serde_json::json!({"agent":"codex","payload":{"prompt":"actual words"}}))
+            .unwrap();
+        let store = doclify_domain::Store::open(dir.path()).unwrap();
+        let out = dir.path().join("out");
+        assert!(doclify_pipeline::process_proposals(
+            &queue,
+            &out,
+            &store,
+            &mut Bad { invented_excerpt }
+        )
+        .is_err());
+        assert_eq!(std::fs::read_dir(out).unwrap().count(), 0);
+        assert_eq!(queue.pending().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn extracted_experiment_outcome_is_preserved() {
+    struct Experiment;
+    impl Extractor for Experiment {
+        fn extract(&mut self, event: &Value) -> io::Result<Value> {
+            Ok(
+                serde_json::json!({"proposals":[{"kind":"experiment","summary":"Try bypass","review":"proposed","evidence":[event["source_id"]],"experiment_outcome":"abandoned"}]}),
+            )
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Queue::open(dir.path().join("q")).unwrap();
+    queue
+        .reconcile(&serde_json::json!({"agent":"claude","payload":{"prompt":"Abandon bypass"}}))
+        .unwrap();
+    let id = queue.pending().unwrap()[0].0.clone();
+    let store = doclify_domain::Store::open(dir.path()).unwrap();
+    doclify_pipeline::process_proposals(&queue, &dir.path().join("out"), &store, &mut Experiment)
+        .unwrap();
+    assert_eq!(
+        store.history(&format!("capture-{id}-0")).unwrap()[0].experiment_outcome,
+        Some(doclify_domain::ExperimentOutcome::Abandoned)
+    );
+}

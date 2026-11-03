@@ -10,6 +10,8 @@ fn validates_answers_and_proposed_edits() {
         result.proposals,
         ProposalBatch {
             proposals: vec![doclify_model_bridge::providers::Proposal {
+                existing_record: None,
+                experiment_outcome: None,
                 kind: "requirement".into(),
                 summary: "Allow guests".into(),
                 review: "proposed".into(),

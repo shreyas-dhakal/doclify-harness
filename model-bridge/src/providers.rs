@@ -10,7 +10,17 @@ pub struct ProposalBatch {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ExistingRecord {
+    pub id: String,
+    pub version: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Proposal {
+    #[serde(default)]
+    pub existing_record: Option<ExistingRecord>,
+    #[serde(default)]
+    pub experiment_outcome: Option<String>,
     pub kind: String,
     pub summary: String,
     pub review: String,
@@ -34,6 +44,12 @@ pub fn validate_proposals(input: &str) -> Result<ProposalBatch, String> {
             || p.implementation.as_deref().is_some_and(|s| {
                 !["unknown", "planned", "partial", "implemented", "reverted"].contains(&s)
             })
+            || p.experiment_outcome.as_deref().is_some_and(|s| {
+                p.kind != "experiment" || !["active", "completed", "abandoned"].contains(&s)
+            })
+            || p.existing_record
+                .as_ref()
+                .is_some_and(|r| r.id.is_empty() || r.version == 0)
             || p.evidence.is_empty()
             || p.evidence.iter().any(|e| e.trim().is_empty())
         {
@@ -44,9 +60,9 @@ pub fn validate_proposals(input: &str) -> Result<ProposalBatch, String> {
 }
 
 pub fn proposal_schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["proposals"],"properties":{"proposals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["kind","summary","review","evidence","rationale","excerpt","implementation"],"properties":{"kind":{"type":"string","enum":["requirement","decision","experiment","question","task"]},"summary":{"type":"string"},"review":{"type":"string","enum":["proposed"]},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":["string","null"]},"excerpt":{"type":["string","null"]},"implementation":{"type":["string","null"],"enum":["unknown","planned","partial","implemented","reverted",null]}}}}}})
+    json!({"type":"object","additionalProperties":false,"required":["proposals"],"properties":{"proposals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["kind","summary","review","evidence","rationale","excerpt","implementation","existing_record","experiment_outcome"],"properties":{"existing_record":{"anyOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["id","version"],"properties":{"id":{"type":"string"},"version":{"type":"integer","minimum":1}}}]},"experiment_outcome":{"type":["string","null"],"enum":["active","completed","abandoned",null]},"kind":{"type":"string","enum":["requirement","decision","experiment","question","task"]},"summary":{"type":"string"},"review":{"type":"string","enum":["proposed"]},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":["string","null"]},"excerpt":{"type":["string","null"]},"implementation":{"type":["string","null"],"enum":["unknown","planned","partial","implemented","reverted",null]}}}}}})
 }
-pub const INSTRUCTION: &str = "Extract documentation proposals from the supplied material. Return only JSON matching the schema. Cite supplied evidence identifiers; never accept a decision. Preserve supported rationale, source excerpts, and implementation status; use null when unknown.";
+pub const INSTRUCTION: &str = "Extract documentation proposals from the supplied material. Return only JSON matching the schema. Cite supplied evidence identifiers; never accept a decision. Preserve supported rationale, source excerpts, and implementation status; use null when unknown. For a revision, set existing_record to the exact id and latest version supplied in existing_records; otherwise use null. Do not merge unrelated claims. Set experiment_outcome only for experiments. Excerpts must be verbatim from the supplied event.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {

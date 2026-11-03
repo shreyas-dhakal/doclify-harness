@@ -122,6 +122,25 @@ impl Store {
         }
         Ok(records)
     }
+    /// Return the latest version of each record in deterministic order.
+    pub fn latest_records(&self) -> io::Result<Vec<Record>> {
+        let mut ids = fs::read_dir(&self.root)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        ids.sort();
+        let mut records = Vec::new();
+        for id in ids {
+            let id = id
+                .to_str()
+                .ok_or_else(|| invalid("invalid record directory"))?;
+            if self.root.join(id).is_dir() {
+                if let Some(record) = self.history(id)?.pop() {
+                    records.push(record);
+                }
+            }
+        }
+        Ok(records)
+    }
     pub fn accepted(&self, id: &str) -> io::Result<Option<Record>> {
         let mut accepted: Option<Record> = None;
         for record in self.history(id)? {

@@ -119,6 +119,75 @@ impl Extractor for SelectedExtractor {
     }
 }
 
+fn validate_extraction(
+    batch: &doclify_model_bridge::providers::ProposalBatch,
+    source: &str,
+    event: &Value,
+    store: &doclify_domain::Store,
+) -> io::Result<()> {
+    fn contains(value: &Value, excerpt: &str) -> bool {
+        match value {
+            Value::String(s) => s.contains(excerpt),
+            Value::Array(a) => a.iter().any(|v| contains(v, excerpt)),
+            Value::Object(o) => o.values().any(|v| contains(v, excerpt)),
+            _ => false,
+        }
+    }
+    let mut targets = std::collections::HashSet::new();
+    for p in &batch.proposals {
+        if p.evidence.iter().any(|e| e != source) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown source citation",
+            ));
+        }
+        if p.excerpt
+            .as_ref()
+            .is_some_and(|e| e.trim().is_empty() || e.chars().count() > 500 || !contains(event, e))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "excerpt must be a bounded verbatim source excerpt",
+            ));
+        }
+        if let Some(target) = &p.existing_record {
+            if !targets.insert(&target.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate revision target",
+                ));
+            }
+            let history = store.history(&target.id)?;
+            let base = history
+                .iter()
+                .find(|r| r.version == target.version)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "unknown record version")
+                })?;
+            let kind = serde_json::to_value(&base.kind).map_err(io::Error::other)?;
+            if kind.as_str() != Some(&p.kind)
+                || base.review == doclify_domain::ReviewState::Proposed
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid revision target",
+                ));
+            }
+            let replay = history.get(target.version as usize).is_some_and(|r| {
+                r.review == doclify_domain::ReviewState::Proposed
+                    && r.provenance.iter().any(|p| p.source == source)
+            });
+            if !replay && history.last().map(|r| r.version) != Some(target.version) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stale record version",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Extract, validate source references, and import immutable proposed records before acknowledgement.
 /// Serialize this operation for each repository, including across processes.
 pub fn process_proposals(
@@ -138,7 +207,9 @@ pub fn process_proposals_locked(
     store: &doclify_domain::Store,
     extractor: &mut impl Extractor,
 ) -> io::Result<usize> {
-    use doclify_domain::{ImplementationState, Provenance, Record, RecordKind, ReviewState};
+    use doclify_domain::{
+        ExperimentOutcome, ImplementationState, Provenance, Record, RecordKind, ReviewState,
+    };
     use doclify_model_bridge::providers::validate_proposals;
     fs::create_dir_all(output)?;
     let mut count = 0;
@@ -149,9 +220,10 @@ pub fn process_proposals_locked(
             serde_json::from_slice::<Value>(&fs::read(&path)?)?
         } else {
             let result =
-                extractor.extract(&serde_json::json!({"source_id":source,"event":event}))?;
+                extractor.extract(&serde_json::json!({"source_id":source,"event":event,"existing_records":store.latest_records()?}))?;
             // Validate before persisting so an invalid provider response can be retried.
             let batch = validate_proposals(&result.to_string()).map_err(io::Error::other)?;
+            validate_extraction(&batch, &source, &event, store)?;
             if batch
                 .proposals
                 .iter()
@@ -167,6 +239,7 @@ pub fn process_proposals_locked(
             result
         };
         let batch = validate_proposals(&result.to_string()).map_err(io::Error::other)?;
+        validate_extraction(&batch, &source, &event, store)?;
         if batch
             .proposals
             .iter()
@@ -179,17 +252,60 @@ pub fn process_proposals_locked(
             ));
         }
         for (index, p) in batch.proposals.into_iter().enumerate() {
+            let kind = match p.kind.as_str() {
+                "requirement" => RecordKind::Requirement,
+                "decision" => RecordKind::Decision,
+                "experiment" => RecordKind::Experiment,
+                "question" => RecordKind::Question,
+                "task" => RecordKind::Task,
+                _ => unreachable!(),
+            };
+            let record_id = p
+                .existing_record
+                .as_ref()
+                .map(|r| r.id.clone())
+                .unwrap_or_else(|| format!("capture-{id}-{index}"));
+            let history = store.history(&record_id)?;
+            let (version, supersedes) = if let Some(target) = &p.existing_record {
+                let base = history
+                    .iter()
+                    .find(|r| r.version == target.version)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "unknown record version")
+                    })?;
+                if base.kind != kind || base.review == ReviewState::Proposed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid revision target",
+                    ));
+                }
+                // A retry may find the already-imported proposal after a crash.
+                let replay = history.get(target.version as usize).is_some_and(|r| {
+                    r.review == ReviewState::Proposed
+                        && r.provenance.iter().any(|p| p.source == source)
+                });
+                if !replay && history.last().map(|r| r.version) != Some(target.version) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stale record version",
+                    ));
+                }
+                let mut accepted = None;
+                for item in history.iter().take(target.version as usize) {
+                    match item.review {
+                        ReviewState::Accepted => accepted = Some(item.version),
+                        ReviewState::Superseded if accepted == item.supersedes => accepted = None,
+                        _ => (),
+                    }
+                }
+                (target.version + 1, accepted)
+            } else {
+                (1, None)
+            };
             let record = Record {
-                id: format!("capture-{id}-{index}"),
-                version: 1,
-                kind: match p.kind.as_str() {
-                    "requirement" => RecordKind::Requirement,
-                    "decision" => RecordKind::Decision,
-                    "experiment" => RecordKind::Experiment,
-                    "question" => RecordKind::Question,
-                    "task" => RecordKind::Task,
-                    _ => unreachable!(),
-                },
+                id: record_id,
+                version,
+                kind,
                 title: p.summary.clone(),
                 statement: p.summary,
                 rationale: p.rationale.unwrap_or_default(),
@@ -201,23 +317,27 @@ pub fn process_proposals_locked(
                     Some("reverted") => ImplementationState::Reverted,
                     _ => ImplementationState::Unknown,
                 },
-                experiment_outcome: None,
+                experiment_outcome: match p.experiment_outcome.as_deref() {
+                    Some("active") => Some(ExperimentOutcome::Active),
+                    Some("completed") => Some(ExperimentOutcome::Completed),
+                    Some("abandoned") => Some(ExperimentOutcome::Abandoned),
+                    _ => None,
+                },
                 provenance: vec![Provenance {
                     source: source.clone(),
                     excerpt: p.excerpt.or_else(|| {
                         event["text"]
                             .as_str()
                             .or(event["event"]["payload"]["prompt"].as_str())
-                            .map(str::to_owned)
+                            .map(|s| s.chars().take(500).collect())
                     }),
                 }],
                 evidence: p.evidence,
-                supersedes: None,
+                supersedes,
             };
-            let history = store.history(&record.id)?;
-            if history.is_empty() {
+            if history.len() < record.version as usize {
                 store.propose(&record)?;
-            } else if history.first() != Some(&record) {
+            } else if history.get(record.version as usize - 1) != Some(&record) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "existing proposal conflicts with extraction",
