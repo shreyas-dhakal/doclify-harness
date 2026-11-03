@@ -319,3 +319,32 @@ fn sync_extracts_and_reviews_a_captured_event() {
             .contains("Allow guest checkout")
     );
 }
+
+#[test]
+fn repl_filters_model_picker_and_selects_match() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/model\ncode\n1\n/quit\n")
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    let model: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), &["model"]).stdout).unwrap();
+    assert_eq!(model["selected"]["provider"], "codex");
+}
