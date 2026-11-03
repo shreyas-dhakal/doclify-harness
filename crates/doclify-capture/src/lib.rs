@@ -107,6 +107,7 @@ impl RepoInfo {
     /// Repository registration is shared through Git’s common directory.
     pub fn registered(&self) -> bool {
         self.common_dir.join("doclify/queue").is_dir()
+            && !self.git_dir.join("doclify/disabled").exists()
     }
 
     /// Primary worktree, used as a fallback for reviewed repository context.

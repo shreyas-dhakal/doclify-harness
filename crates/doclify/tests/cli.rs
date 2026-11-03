@@ -1,8 +1,28 @@
 use doclify_domain::{ImplementationState, Provenance, Record, RecordKind, ReviewState, Store};
 use std::{fs, process::Command};
 fn run(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    let home = doclify_capture::RepoInfo::discover(dir)
+        .map(|repo| repo.git_dir.join("test-home"))
+        .unwrap_or_else(|| dir.join("test-home"));
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["launchctl", "systemctl"] {
+        let path = bin.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     Command::new(env!("CARGO_BIN_EXE_doclify"))
         .current_dir(dir)
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         .args(args)
         .output()
         .unwrap()

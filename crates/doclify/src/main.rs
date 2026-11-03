@@ -1,3 +1,4 @@
+mod recovery;
 use doclify_capture::queue::Queue;
 use doclify_capture::{hook, install, Agent, RepoInfo};
 use doclify_domain::{ImplementationState, Provenance, Record, RecordKind, ReviewState, Store};
@@ -34,6 +35,13 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.first().is_some_and(|a| a == "background-worker") {
+        if !std::env::current_dir()
+            .ok()
+            .and_then(|cwd| RepoInfo::discover(&cwd))
+            .is_some_and(|repo| repo.registered())
+        {
+            return ExitCode::SUCCESS;
+        }
         // Contending hook workers retry so the last event is not stranded.
         for _ in 0..60 {
             match run(&["sync".into()]) {
@@ -91,11 +99,26 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
         ["init"] => {
             let paths = install::install(&repo, "doclify")?;
             Store::open(&repo.worktree)?;
+            let recovery = match recovery::install(&repo) {
+                Ok(value) => {
+                    let _ = fs::remove_file(repo.git_dir.join("doclify/recovery-error"));
+                    value
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    fs::write(repo.git_dir.join("doclify/recovery-error"), &message)?;
+                    json!({"active":false,"error":message})
+                }
+            };
             Ok(
-                json!({"installed": paths, "notice":"Codex requires project trust and hook approval."}),
+                json!({"installed": paths, "recovery": recovery, "notice":"Codex requires project trust and hook approval."}),
             )
         }
-        ["uninstall"] => Ok(json!({"removed":install::uninstall(&repo.worktree)?})),
+        ["uninstall"] => {
+            let removed = install::uninstall(&repo.worktree)?;
+            recovery::uninstall(&repo)?;
+            Ok(json!({"removed":removed}))
+        }
         ["status"] => {
             let queue = Queue::open(repo.git_dir.join("doclify/jobs"))?;
             let count = if repo.queue_dir().is_dir() {
@@ -117,7 +140,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 json!({"registered": repo.registered(), "pending_events":count, "rejected_events":rejected_count(&repo.queue_dir())?,
                 "pending_extraction":queue.pending()?.len(), "pending_review":pending,
                 "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.git_dir.join("doclify/worker-error")).ok(),
-                "codex_hook_approval":"not verified"}),
+                "recovery_error":fs::read_to_string(repo.git_dir.join("doclify/recovery-error")).ok(), "codex_hook_approval":"not verified"}),
             )
         }
         ["sync"] => {

@@ -41,6 +41,11 @@ pub fn hook_command(exe: &str, agent: Agent) -> String {
 pub fn install(repo: &RepoInfo, exe: &str) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(repo.common_dir.join("doclify/queue"))?;
     fs::create_dir_all(repo.queue_dir())?;
+    match fs::remove_file(repo.git_dir.join("doclify/disabled")) {
+        Ok(()) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     [Agent::Claude, Agent::Codex]
         .into_iter()
         .map(|agent| {
@@ -62,6 +67,10 @@ pub fn uninstall(worktree: &Path) -> io::Result<Vec<PathBuf>> {
         if path.exists() && edit(&path, remove_ours)? {
             changed.push(path);
         }
+    }
+    if let Some(repo) = RepoInfo::discover(worktree) {
+        fs::create_dir_all(repo.git_dir.join("doclify"))?;
+        fs::write(repo.git_dir.join("doclify/disabled"), b"disabled\n")?;
     }
     Ok(changed)
 }

@@ -8,6 +8,7 @@ doclify-domain = { path = "../doclify-domain" }
 doclify-capture = { path = "../doclify-capture" }
 doclify-model-bridge = { path = "../../model-bridge" }
 serde_json = "1"
+sha2 = "0.10"
 url = "2"
 doclify-evidence = { path = "../doclify-evidence" }
 doclify-context = { path = "../doclify-context" }

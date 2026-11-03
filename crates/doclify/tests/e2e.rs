@@ -54,6 +54,12 @@ impl Env {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        for name in ["launchctl", "systemctl"] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = bin.join(name);
+            fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let env = Env {
             _tmp: tmp,
             repo,
@@ -431,7 +437,11 @@ fn linked_worktree_capture_is_isolated_and_not_duplicated() {
     find(&records, "Sessions expire after 30 minutes");
     assert_eq!(records.len(), 1, "{records:#?}");
     sync(&env, &wt);
-    assert_eq!(env.pending_review(&wt).len(), 1, "restart preserves the completed result");
+    assert_eq!(
+        env.pending_review(&wt).len(),
+        1,
+        "restart preserves the completed result"
+    );
     assert_eq!(provider.count(), 1, "extracted exactly once");
 }
 
@@ -451,7 +461,11 @@ fn restart_after_provider_failure_and_kill_is_lossless() {
             "[[requirement|Guest carts persist for 7 days]]",
         )],
     );
-    env.hook(&env.repo, "codex", &json!({"hook_event_name":"UserPromptSubmit","session_id":"restart-1","cwd":env.repo,"prompt":"[[decision|Guest emails are verified at checkout]]"}));
+    doclify_capture::hook::enqueue(
+        doclify_capture::Agent::Codex,
+        json!({"hook_event_name":"UserPromptSubmit","session_id":"restart-1","cwd":env.repo,"prompt":"[[decision|Guest emails are verified at checkout]]"}).to_string().as_bytes(),
+        &env.repo,
+    ).unwrap();
 
     provider.fail.store(true, Ordering::SeqCst);
     let out = env.run(&env.repo, &["sync"]);
@@ -764,4 +778,67 @@ fn release_binary_embeds_viewer_assets() {
             "asset not embedded"
         );
     }
+}
+
+#[test]
+fn uninstall_disables_capture_until_reinitialization() {
+    let env = Env::new();
+    env.json(&env.repo, &["uninstall"]);
+    assert_eq!(env.json(&env.repo, &["status"])["registered"], false);
+    env.hook(&env.repo, "claude", &json!({"session_id":"disabled"}));
+    assert_eq!(env.json(&env.repo, &["status"])["pending_events"], 0);
+    env.json(&env.repo, &["init"]);
+    assert_eq!(env.json(&env.repo, &["status"])["registered"], true);
+}
+
+#[test]
+fn recovery_registration_is_installed_and_removed() {
+    let env = Env::new();
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["launchctl", "systemctl"] {
+        let path = env.bin.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let init = env.json(&env.repo, &["init"]);
+    assert_eq!(init["recovery"]["active"], true);
+    let files = init["recovery"]["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    let paths: Vec<_> = files
+        .iter()
+        .map(|p| PathBuf::from(p.as_str().unwrap()))
+        .collect();
+    assert!(paths.iter().all(|p| p.is_file()));
+    env.json(&env.repo, &["uninstall"]);
+    assert!(paths.iter().all(|p| !p.exists()));
+}
+
+#[test]
+fn scheduled_worker_discovers_missed_sessions_and_retries_failure() {
+    let env = Env::new();
+    let provider = Provider::start();
+    env.use_provider(&env.repo, &provider);
+    env.codex_rollout(
+        "missed",
+        &env.repo,
+        &[codex_message(
+            "m1",
+            "user",
+            "[[requirement|Recover without a hook]]",
+        )],
+    );
+    provider.fail.store(true, Ordering::SeqCst);
+    assert!(!env.run(&env.repo, &["background-worker"]).status.success());
+    assert!(
+        env.json(&env.repo, &["status"])["pending_extraction"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    provider.fail.store(false, Ordering::SeqCst);
+    assert!(env.run(&env.repo, &["background-worker"]).status.success());
+    find(&env.pending_review(&env.repo), "Recover without a hook");
+    let calls = provider.count();
+    assert!(env.run(&env.repo, &["background-worker"]).status.success());
+    assert_eq!(provider.count(), calls);
 }
