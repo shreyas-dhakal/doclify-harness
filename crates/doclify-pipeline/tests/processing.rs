@@ -277,3 +277,38 @@ fi
     );
     assert!(queue.pending().unwrap().is_empty());
 }
+
+#[test]
+fn hook_cannot_import_another_repositorys_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let other = dir.path().join("other");
+    let sessions = dir.path().join("sessions");
+    let hooks = dir.path().join("hooks");
+    for path in [&repo, &other, &sessions, &hooks] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let transcript = sessions.join("other.jsonl");
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"other","cwd":other}})
+        ),
+    )
+    .unwrap();
+    std::fs::write(hooks.join("event.json"), serde_json::json!({"agent":"codex","payload":{"session_id":"other","transcript_path":transcript}}).to_string()).unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    let store = doclify_domain::Store::open(&repo).unwrap();
+    let result = doclify_pipeline::run_once(
+        &queue,
+        &hooks,
+        &repo,
+        &[("codex", &sessions)],
+        &dir.path().join("out"),
+        &store,
+        &mut Provider { fail: true },
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    assert!(queue.pending().unwrap().is_empty());
+}

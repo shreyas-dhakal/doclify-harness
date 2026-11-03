@@ -286,10 +286,61 @@ pub fn run_once(
     extractor: &mut impl Extractor,
 ) -> io::Result<usize> {
     let _lock = queue.lock()?;
-    let roots: Vec<&Path> = sessions.iter().map(|(_, root)| *root).collect();
-    queue.drain_hooks_with_roots(hook_dir, &roots)?;
+    let repository = repository.canonicalize()?;
+    for (path, event) in doclify_capture::hook::pending(hook_dir)? {
+        if let Some(transcript) = event["payload"]["transcript_path"].as_str() {
+            let agent = event["agent"].as_str().unwrap_or("");
+            let session = event["payload"]["session_id"].as_str().unwrap_or("");
+            let path_obj = Path::new(transcript);
+            let (root, relative) = sessions
+                .iter()
+                .filter(|(name, _)| *name == agent)
+                .find_map(|(_, root)| path_obj.strip_prefix(root).ok().map(|rel| (*root, rel)))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "transcript outside agent roots",
+                    )
+                })?;
+            let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+            let bytes = dir.read(relative)?;
+            let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+            let value: Value = serde_json::from_slice(first).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid transcript metadata",
+                )
+            })?;
+            let metadata = match agent {
+                "codex" if value["type"] == "session_meta" => &value["payload"],
+                "claude" => &value,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "invalid transcript agent",
+                    ))
+                }
+            };
+            let id = metadata[if agent == "codex" { "id" } else { "sessionId" }].as_str();
+            let owns = metadata["cwd"]
+                .as_str()
+                .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                .is_some_and(|cwd| cwd.starts_with(&repository));
+            if session.is_empty() || id != Some(session) || !owns {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transcript session does not belong to repository",
+                ));
+            }
+            queue.reconcile_snapshot(&event, &[root], Some(&bytes))?;
+        } else {
+            queue.reconcile(&event)?;
+        }
+        fs::remove_file(path)?;
+        fs::File::open(hook_dir)?.sync_all()?;
+    }
     for (agent, root) in sessions {
-        discover_sessions(queue, repository, agent, root)?;
+        discover_sessions(queue, &repository, agent, root)?;
     }
     process_proposals(queue, output, store, extractor)
 }
