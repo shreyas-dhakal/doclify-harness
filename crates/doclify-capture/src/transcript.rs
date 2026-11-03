@@ -5,7 +5,7 @@
 //! Verified against Codex CLI 0.166.0 rollouts and Claude Code 2.1.308 sessions.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use serde_json::Value;
@@ -48,8 +48,13 @@ pub struct ReadResult {
 /// being written and is left for the next call. If the file shrank (rewritten
 /// or rotated), reading restarts at 0; entry ids make the replay idempotent.
 pub fn read(agent: Agent, path: &Path, offset: u64) -> io::Result<ReadResult> {
-    let mut file = File::open(path)?;
-    let offset = if file.metadata()?.len() < offset {
+    let file = File::open(path)?;
+    read_from(agent, file, offset)
+}
+
+/// Parse an immutable snapshot so offsets and hashes describe the same bytes.
+pub fn read_from(agent: Agent, mut file: impl Read + Seek, offset: u64) -> io::Result<ReadResult> {
+    let offset = if file.seek(SeekFrom::End(0))? < offset {
         0
     } else {
         offset

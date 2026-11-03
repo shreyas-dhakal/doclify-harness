@@ -42,10 +42,16 @@ pub fn session_context(raw: &[u8], fallback_cwd: &Path) -> Option<String> {
     if payload["hook_event_name"] != "SessionStart" {
         return None;
     }
-    let cwd = payload["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| fallback_cwd.to_path_buf());
+    let cwd = payload["cwd"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
     // ponytail: second `git rev-parse` after enqueue's; share RepoInfo if hook latency matters.
     let repo = RepoInfo::discover(&cwd)?;
-    let scope = doclify_context::Scope { branch: repo.branch, topic: None };
+    let scope = doclify_context::Scope {
+        branch: repo.branch,
+        topic: None,
+    };
     let context = doclify_context::build(&repo.worktree, &scope, &Default::default()).ok()??;
     let out = json!({
         "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context.render() }
@@ -90,7 +96,16 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
     );
     let tmp = dir.join(format!("{name}.tmp"));
     let path = dir.join(format!("{name}.json"));
-    fs::write(&tmp, serde_json::to_vec(&event)?)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&tmp)?
+        .write_all(&serde_json::to_vec(&event)?)?;
     fs::rename(&tmp, &path)?;
     Ok(Some(path))
 }

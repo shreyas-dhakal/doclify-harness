@@ -169,7 +169,6 @@ pub fn discover_sessions(
     agent: &str,
     root: &Path,
 ) -> io::Result<usize> {
-    use std::io::BufRead;
     if agent != "codex" && agent != "claude" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -177,6 +176,7 @@ pub fn discover_sessions(
         ));
     }
     let repository = repository.canonicalize()?;
+    let scoped = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
     let mut dirs = vec![root.to_path_buf()];
     let mut count = 0;
     while let Some(dir) = dirs.pop() {
@@ -191,12 +191,13 @@ pub fn discover_sessions(
             {
                 continue;
             }
-            let mut line = String::new();
-            std::io::BufReader::new(fs::File::open(entry.path())?).read_line(&mut line)?;
-            if !line.ends_with('\n') {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+            let bytes = scoped.read(relative)?;
+            let Some(end) = bytes.iter().position(|b| *b == b'\n') else {
                 continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes[..end]) else {
                 continue;
             };
             let metadata = if agent == "codex" && value["type"] == "session_meta" {
@@ -220,7 +221,7 @@ pub fn discover_sessions(
             {
                 continue;
             }
-            queue.reconcile(&serde_json::json!({"agent": agent, "payload": {"session_id":session, "transcript_path":entry.path()}}))?;
+            queue.reconcile_snapshot(&serde_json::json!({"agent": agent, "payload": {"session_id":session, "transcript_path":entry.path()}}), &[root], Some(&bytes))?;
             count += 1;
         }
     }
@@ -238,7 +239,9 @@ pub fn run_once(
     store: &doclify_domain::Store,
     extractor: &mut impl Extractor,
 ) -> io::Result<usize> {
-    queue.drain_hooks(hook_dir)?;
+    let _lock = queue.lock()?;
+    let roots: Vec<&Path> = sessions.iter().map(|(_, root)| *root).collect();
+    queue.drain_hooks_with_roots(hook_dir, &roots)?;
     for (agent, root) in sessions {
         discover_sessions(queue, repository, agent, root)?;
     }
