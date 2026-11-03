@@ -672,3 +672,81 @@ fn repl_discovers_filters_and_selects_api_model_without_losing_configuration() {
     assert_eq!(selected["base_url"], url);
     assert_eq!(selected["api_key_env"], "DOCLIFY_REPL_KEY");
 }
+
+#[test]
+fn rejected_events_explain_failure_and_can_be_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(run(dir.path(), &["init"]).status.success());
+    let queue = dir.path().join(".git/doclify/queue");
+    fs::write(
+        queue.join("bad.json"),
+        br#"{"agent":"claude","payload":{"transcript_path":"/outside","session_id":"s"}}"#,
+    )
+    .unwrap();
+    assert!(run(dir.path(), &["sync"]).status.success());
+    let result = run(dir.path(), &["rejected"]);
+    let list: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(list["events"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("transcript"));
+    let id = list["events"][0]["id"].as_str().unwrap();
+    let result = run(dir.path(), &["rejected", "replay", id]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(queue.join(id).exists());
+}
+
+#[test]
+fn picker_keeps_configured_model_when_discovery_fails() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(run(
+        dir.path(),
+        &[
+            "model",
+            "set",
+            "openai",
+            "http://127.0.0.1:1",
+            "DOCLIFY_MISSING_TEST_KEY",
+            "offline-model"
+        ]
+    )
+    .status
+    .success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .current_dir(dir.path())
+        .env_remove("DOCLIFY_MISSING_TEST_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/model\n\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("offline-model (API availability and authentication unverified)"),
+        "{text}"
+    );
+    assert!(text.contains("\"capability\": \"unavailable\""));
+}

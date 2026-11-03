@@ -73,7 +73,7 @@ fn main() -> ExitCode {
     if args.is_empty() {
         return repl();
     }
-    if args.first().is_some_and(|a| a == "docs") {
+    if args.as_slice() == ["docs"] || args.as_slice() == ["docs", "--json"] {
         return docs(false);
     }
     match run(&args) {
@@ -138,10 +138,37 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             let evidence = doclify_evidence::load(&repo.git_dir.join("doclify"))?;
             Ok(
                 json!({"registered": repo.registered(), "pending_events":count, "rejected_events":rejected_count(&repo.queue_dir())?,
-                "pending_extraction":queue.pending()?.len(), "pending_review":pending,
+                "pending_extraction":queue.pending()?.len(), "rejected_details":rejected_events(&repo.queue_dir())?, "pending_review":pending,
                 "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.git_dir.join("doclify/worker-error")).ok(),
                 "recovery_error":fs::read_to_string(repo.git_dir.join("doclify/recovery-error")).ok(), "codex_hook_approval":"not verified"}),
             )
+        }
+        ["rejected"] => Ok(json!({"events": rejected_events(&repo.queue_dir())?})),
+        ["rejected", "replay", id] => {
+            let dir = repo.queue_dir().join("rejected");
+            if id.is_empty()
+                || std::path::Path::new(id)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    != Some(id)
+                || id.starts_with('.')
+            {
+                return Err("invalid rejected event id".into());
+            }
+            let path = dir.join(id);
+            let value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+            let bytes = if let Some(raw) = value.get("event_bytes") {
+                serde_json::from_value::<Vec<u8>>(raw.clone())?
+            } else {
+                serde_json::to_vec(value.get("event").unwrap_or(&value))?
+            };
+            let destination = repo.queue_dir().join(id);
+            if destination.exists() {
+                return Err("pending event already exists".into());
+            }
+            doclify_capture::queue::atomic_write(&destination, &bytes)?;
+            fs::remove_file(path)?;
+            Ok(json!({"replayed":id}))
         }
         ["sync"] => {
             if repo.registered() {
@@ -218,10 +245,10 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             let models = model_list(&repo)?;
             Ok(
                 json!({"repository":repo.worktree,"registered":repo.registered(),
-                "hooks":{"claude":install::config_path(&repo.worktree, Agent::Claude).exists(),
-                         "codex":install::config_path(&repo.worktree, Agent::Codex).exists(),
+                "hooks":{"claude":hook_status(&repo.worktree, Agent::Claude),
+                         "codex":hook_status(&repo.worktree, Agent::Codex),
                          "codex_approval":"unverified"},"models":models,
-                "capture_compatibility":"transcript formats are checked during sync"}),
+                "versions":{"claude":agent_version("claude"),"codex":agent_version("codex")}, "capture_compatibility":"unverified; transcript formats are checked during sync"}),
             )
         }
         ["review", id, version, action] => {
@@ -252,7 +279,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             Ok(json!({"pending_review":pending}))
         }
         ["help"] => Ok(
-            json!({"commands":["init", "uninstall", "status", "sync", "doctor", "model [list|set claude|codex|set openai|anthropic <url> <key-env> <model>]", "review [<id> <version> <accept|reject|supersede>]", "docs", "handoff [topic]", "help", "quit"]}),
+            json!({"commands":["init", "uninstall", "status", "sync", "doctor", "rejected [replay <id>]", "model [list|set claude|codex|set openai|anthropic <url> <key-env> <model>]", "review [<id> <version> <accept|reject|supersede>]", "docs", "handoff [topic]", "help", "quit"]}),
         ),
         _ => Err("unknown command; run doclify help".into()),
     }
@@ -366,6 +393,13 @@ fn repl() -> ExitCode {
                 }
             };
             let mut choices = vec!["claude".to_owned(), "codex".to_owned()];
+            if let Some(id) = config
+                .as_ref()
+                .and_then(|c| c["model"].as_str())
+                .filter(|id| !id.is_empty())
+            {
+                choices.push(id.to_owned());
+            }
             if let Some(ref config) = config {
                 if matches!(config["provider"].as_str(), Some("openai" | "anthropic")) {
                     match doclify::repl::discover_models(config) {
@@ -374,10 +408,16 @@ fn repl() -> ExitCode {
                     }
                 }
             }
+            choices.dedup();
             let mut shown = choices.clone();
             loop {
                 for (i, choice) in shown.iter().enumerate() {
-                    println!("{}: {}", i + 1, choice);
+                    let status = if choice == "claude" || choice == "codex" {
+                        "see bridge capability above; authentication unverified"
+                    } else {
+                        "API availability and authentication unverified"
+                    };
+                    println!("{}: {} ({})", i + 1, choice, status);
                 }
                 print!("model search> ");
                 let _ = stdout.flush();
@@ -582,6 +622,64 @@ fn docs(background: bool) -> ExitCode {
     }
 }
 
+fn hook_status(worktree: &std::path::Path, agent: Agent) -> Value {
+    let path = install::config_path(worktree, agent);
+    let parsed = fs::read(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()));
+    let events = ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop"];
+    let missing: Vec<_> = events
+        .into_iter()
+        .filter(|event| {
+            !parsed
+                .as_ref()
+                .ok()
+                .and_then(|v| v["hooks"][*event].as_array())
+                .is_some_and(|groups| {
+                    groups.iter().any(|g| {
+                        g["hooks"].as_array().is_some_and(|handlers| {
+                            handlers.iter().any(|h| {
+                                h["command"].as_str().is_some_and(|c| {
+                                    c.starts_with(install::MARKER)
+                                        && c.contains(&format!(" hook {} ", agent.name()))
+                                })
+                            })
+                        })
+                    })
+                })
+        })
+        .collect();
+    json!({"installed":missing.is_empty(), "missing_events":missing, "config":path, "error":parsed.err(), "execution":"unverified"})
+}
+fn agent_version(name: &str) -> Value {
+    match std::process::Command::new(name).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            json!({"reported":String::from_utf8_lossy(&out.stdout).trim(),"compatibility":"unverified"})
+        }
+        Ok(out) => {
+            json!({"reported":null,"error":format!("version command exited {}", out.status),"compatibility":"unverified"})
+        }
+        Err(e) => json!({"reported":null,"error":e.to_string(),"compatibility":"unverified"}),
+    }
+}
+fn rejected_events(hook_dir: &std::path::Path) -> io::Result<Vec<Value>> {
+    let entries = match fs::read_dir(hook_dir.join("rejected")) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    let mut events = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+        events.push(json!({"id":entry.file_name().to_string_lossy(),"reason":value.get("reason").and_then(Value::as_str).unwrap_or("reason unavailable (rejected by an earlier version)")}));
+    }
+    events.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(events)
+}
 fn rejected_count(hook_dir: &std::path::Path) -> io::Result<usize> {
     match fs::read_dir(hook_dir.join("rejected")) {
         Ok(entries) => Ok(entries.count()),
@@ -666,6 +764,26 @@ fn captured_jobs(root: &std::path::Path) -> io::Result<Vec<Value>> {
             jobs.push(serde_json::from_slice(&fs::read(entry.path())?)?);
         }
     }
+    match fs::read_dir(root.join("events")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let event: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+                if event["payload"]["transcript_path"].is_string()
+                    && event["payload"]["hook_event_name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("PostToolUse"))
+                {
+                    jobs.push(json!({"source":"hook", "event":event}));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     Ok(jobs)
 }
 
@@ -681,5 +799,35 @@ mod tests {
             fs::write(dir.path().join(name).join("job"), br#"{"source":"hook"}"#).unwrap();
         }
         assert_eq!(captured_jobs(dir.path()).unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn captured_jobs_include_raw_tool_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["pending", "done", "events"] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        fs::write(dir.path().join("events/tool"), br#"{"agent":"claude","payload":{"hook_event_name":"PostToolUse","transcript_path":"/tmp/transcript","tool_input":{"command":"cargo test"}}}"#).unwrap();
+        let jobs = captured_jobs(dir.path()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(doclify_evidence::verify::test_runs(&jobs).len(), 1);
+        assert_eq!(
+            jobs[0]["event"]["payload"]["hook_event_name"],
+            "PostToolUse"
+        );
+    }
+    #[test]
+    fn doctor_checks_hook_entries_not_file_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = install::config_path(dir.path(), Agent::Claude);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{}").unwrap();
+        let status = hook_status(dir.path(), Agent::Claude);
+        assert_eq!(status["installed"], false);
+        assert_eq!(status["missing_events"].as_array().unwrap().len(), 4);
     }
 }

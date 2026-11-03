@@ -524,7 +524,14 @@ pub fn reconcile_repository_locked(
             {
                 let rejected = hook_dir.join("rejected");
                 fs::create_dir_all(&rejected)?;
-                fs::rename(&path, rejected.join(path.file_name().unwrap()))?;
+                let original = fs::read(&path)?;
+                doclify_capture::queue::atomic_write(
+                    &rejected.join(path.file_name().unwrap()),
+                    &serde_json::to_vec(
+                        &serde_json::json!({"event_bytes":original,"reason":e.to_string()}),
+                    )?,
+                )?;
+                fs::remove_file(&path)?;
                 fs::File::open(&rejected)?.sync_all()?;
             }
             Err(e) => return Err(e),
