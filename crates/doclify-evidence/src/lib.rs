@@ -4,12 +4,17 @@
 use doclify_domain::{Record, Store};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 pub mod docs;
+pub mod verify;
+pub use verify::{SessionLink, TestOutcome, TestRun, TestSource};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Branch {
@@ -37,6 +42,17 @@ pub struct Commit {
 pub struct Review {
     pub author: String,
     pub state: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comment {
+    pub author: String,
+    /// Truncated to `MAX_DISCUSSION` characters.
+    pub body: String,
+    pub created_at: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
@@ -49,8 +65,15 @@ pub struct PullRequest {
     pub base: String,
     pub merged_at: Option<String>,
     pub merge_commit: Option<String>,
+    #[serde(default)]
+    pub merged_by: Option<String>,
+    /// GitHub's aggregate, e.g. `APPROVED` or `CHANGES_REQUESTED`.
+    #[serde(default)]
+    pub review_decision: Option<String>,
     pub reviews: Vec<Review>,
     pub comment_count: usize,
+    #[serde(default)]
+    pub comments: Vec<Comment>,
 }
 /// GitHub is optional: absence or failure is recorded, never fatal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +105,10 @@ pub struct Evidence {
     pub commits: Vec<Commit>,
     pub github: Github,
     pub links: Vec<Link>,
+    #[serde(default)]
+    pub tests: Vec<TestRun>,
+    #[serde(default)]
+    pub sessions: Vec<SessionLink>,
 }
 
 pub struct SyncOptions<'a> {
@@ -90,12 +117,18 @@ pub struct SyncOptions<'a> {
     pub max_pull_requests: usize,
     /// `None` skips GitHub entirely; otherwise the `gh` executable to run.
     pub gh: Option<&'a str>,
+    /// `gh` is killed after this; its output is capped at `MAX_GH_OUTPUT`.
+    pub gh_timeout: Duration,
+    /// Captured hook events and transcript jobs (see `verify`).
+    pub captured: &'a [serde_json::Value],
 }
 impl Default for SyncOptions<'_> {
     fn default() -> Self {
-        Self { max_commits: 500, max_pull_requests: 100, gh: Some("gh") }
+        Self { max_commits: 500, max_pull_requests: 100, gh: Some("gh"), gh_timeout: Duration::from_secs(30), captured: &[] }
     }
 }
+pub const MAX_GH_OUTPUT: usize = 32 << 20;
+pub const MAX_DISCUSSION: usize = 1000;
 
 /// Reads evidence and stores the snapshot at `local_dir/evidence.json`
 /// (rebuildable, machine-local: pass an ignored directory).
@@ -108,11 +141,14 @@ pub fn sync(repo: &Path, local_dir: &Path, options: &SyncOptions) -> io::Result<
     let branches = branches(repo)?;
     let commits = if branches.is_empty() { vec![] } else { commits(repo, options.max_commits)? };
     let github = match options.gh {
-        Some(gh) => pull_requests(repo, gh, options.max_pull_requests),
+        Some(gh) => pull_requests(repo, gh, options.max_pull_requests, options.gh_timeout),
         None => Github::Unavailable { reason: "GitHub sync disabled".into() },
     };
     let links = link(&records, &commits, &github);
-    let evidence = Evidence { head, branches, commits, github, links };
+    let mut tests = verify::test_runs(options.captured);
+    verify::mark_stale(repo, head.as_deref(), &mut tests);
+    let sessions = verify::sessions(options.captured, &commits);
+    let evidence = Evidence { head, branches, commits, github, links, tests, sessions };
     fs::create_dir_all(local_dir)?;
     write_atomic(
         &local_dir.join("evidence.json"),
@@ -207,11 +243,11 @@ pub fn diff(repo: &Path, sha: &str) -> io::Result<String> {
     git(repo, &["show", "--format=", "--patch", sha, "--"])
 }
 
-// ponytail: no timeout on gh; wrap in a deadline if hung network calls show up.
-fn pull_requests(repo: &Path, gh: &str, max: usize) -> Github {
+/// One read-only `gh pr list` call, bounded by `max`, `timeout`, and `MAX_GH_OUTPUT`.
+fn pull_requests(repo: &Path, gh: &str, max: usize, timeout: Duration) -> Github {
     let unavailable = |reason: String| Github::Unavailable { reason };
-    let out = match Command::new(gh)
-        .current_dir(repo)
+    let mut cmd = Command::new(gh);
+    cmd.current_dir(repo)
         .env("GH_PROMPT_DISABLED", "1")
         .args([
             "pr",
@@ -221,22 +257,23 @@ fn pull_requests(repo: &Path, gh: &str, max: usize) -> Github {
             "--limit",
             &max.to_string(),
             "--json",
-            "number,title,body,state,url,headRefName,baseRefName,mergedAt,mergeCommit,reviews,comments",
-        ])
-        .output()
-    {
+            "number,title,body,state,url,headRefName,baseRefName,mergedAt,mergeCommit,mergedBy,reviewDecision,reviews,comments",
+        ]);
+    let (ok, stdout, stderr) = match run_bounded(cmd, timeout) {
         Ok(out) => out,
-        Err(e) => return unavailable(format!("could not run {gh}: {e}")),
+        Err(e) => return unavailable(format!("{gh}: {e}")),
     };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    if !ok {
+        let stderr = String::from_utf8_lossy(&stderr);
         return unavailable(stderr.lines().next().unwrap_or("gh failed").trim().to_owned());
     }
-    let prs: Vec<serde_json::Value> = match serde_json::from_slice(&out.stdout) {
+    let prs: Vec<serde_json::Value> = match serde_json::from_slice(&stdout) {
         Ok(v) => v,
         Err(e) => return unavailable(format!("unexpected gh output: {e}")),
     };
     let s = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_owned();
+    let opt = |v: &serde_json::Value| v.as_str().filter(|m| !m.is_empty()).map(String::from);
+    let clip = |v: &serde_json::Value| v.as_str().unwrap_or_default().chars().take(MAX_DISCUSSION).collect::<String>();
     let pull_requests = prs
         .iter()
         .map(|p| PullRequest {
@@ -247,15 +284,28 @@ fn pull_requests(repo: &Path, gh: &str, max: usize) -> Github {
             url: s(p, "url"),
             head: s(p, "headRefName"),
             base: s(p, "baseRefName"),
-            merged_at: p["mergedAt"].as_str().filter(|m| !m.is_empty()).map(Into::into),
-            merge_commit: p["mergeCommit"]["oid"].as_str().map(Into::into),
+            merged_at: opt(&p["mergedAt"]),
+            merge_commit: opt(&p["mergeCommit"]["oid"]),
+            merged_by: opt(&p["mergedBy"]["login"]),
+            review_decision: opt(&p["reviewDecision"]),
             reviews: p["reviews"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|r| Review { author: s(&r["author"], "login"), state: s(r, "state") })
+                .map(|r| Review {
+                    author: s(&r["author"], "login"),
+                    state: s(r, "state"),
+                    body: clip(&r["body"]),
+                    submitted_at: opt(&r["submittedAt"]),
+                })
                 .collect(),
             comment_count: p["comments"].as_array().map_or(0, Vec::len),
+            comments: p["comments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| Comment { author: s(&c["author"], "login"), body: clip(&c["body"]), created_at: opt(&c["createdAt"]) })
+                .collect(),
         })
         .collect();
     Github::Available { pull_requests }
@@ -286,7 +336,7 @@ pub fn link(records: &[Vec<Record>], commits: &[Commit], github: &Github) -> Vec
             let target = format!("pr:{}", p.number);
             if cited.contains(&target.as_str()) {
                 links.push(Link { record: id.into(), target, basis: Basis::Direct, reason: "cited by record".into() });
-            } else if [&p.title, &p.body, &p.head].iter().any(|t| mentions(t, id)) {
+            } else if [&p.title, &p.body, &p.head].into_iter().chain(p.comments.iter().map(|c| &c.body)).chain(p.reviews.iter().map(|r| &r.body)).any(|t| mentions(t, id)) {
                 links.push(Link { record: id.into(), target, basis: Basis::Suggested, reason: "pull request mentions record id".into() });
             }
         }
@@ -295,12 +345,53 @@ pub fn link(records: &[Vec<Record>], commits: &[Commit], github: &Github) -> Vec
 }
 
 /// Whole-token match, so `decision-a` does not match `decision-ab`.
-fn mentions(text: &str, id: &str) -> bool {
+pub(crate) fn mentions(text: &str, id: &str) -> bool {
     let token = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     text.match_indices(id).any(|(i, _)| {
         !text[..i].chars().next_back().is_some_and(token)
             && !text[i + id.len()..].chars().next().is_some_and(token)
     })
+}
+
+/// Runs `cmd` with a deadline and capped stdout. Returns (success, stdout, stderr).
+/// Readers report over channels so a grandchild holding a pipe cannot hang sync.
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run: {e}"))?;
+    let pipe = |r: Box<dyn Read + Send>, cap: usize| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = r.take(cap as u64 + 1).read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    };
+    let stdout = pipe(Box::new(child.stdout.take().unwrap()), MAX_GH_OUTPUT);
+    let stderr = pipe(Box::new(child.stderr.take().unwrap()), 64 << 10);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs_f32()));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100));
+    let out = stdout.recv_timeout(left).map_err(|_| "output did not close".to_owned())?;
+    if out.len() > MAX_GH_OUTPUT {
+        return Err(format!("output exceeded {MAX_GH_OUTPUT} bytes"));
+    }
+    Ok((status.success(), out, stderr.recv_timeout(Duration::from_millis(100)).unwrap_or_default()))
 }
 
 fn git(repo: &Path, args: &[&str]) -> io::Result<String> {

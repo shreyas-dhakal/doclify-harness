@@ -1,8 +1,9 @@
 //! Standard documentation under `docs/doclify/`. Each page is regenerated
-//! against the last generated copy in `.doclify/generated/`; a page a human
-//! edited is never overwritten, and a changed regeneration of it is written to
+//! against the last generated copy in `.doclify/generated/`. Human edits are
+//! three-way merged with the regeneration (`git merge-file`); edits that
+//! overlap it are never overwritten, and the regeneration is written to
 //! `.doclify/conflicts/` for review instead.
-use crate::{load_records, write_atomic, Basis, Evidence, Github};
+use crate::{load_records, write_atomic, Basis, Evidence, Github, TestOutcome, TestSource};
 use doclify_domain::{ExperimentOutcome, ImplementationState, Record, RecordKind, ReviewState, Store};
 use serde::Serialize;
 use std::{fmt::Write, fs, io, path::Path};
@@ -24,6 +25,9 @@ pub struct Report {
     pub unchanged: Vec<String>,
     /// Human-edited pages whose generated content did not change.
     pub kept_human: Vec<String>,
+    /// Human-edited pages the regeneration merged into without overlap.
+    #[serde(default)]
+    pub merged: Vec<String>,
     /// Human-edited pages whose regeneration waits in `.doclify/conflicts/`.
     pub conflicts: Vec<String>,
 }
@@ -74,7 +78,6 @@ pub fn resolve_conflict(repo: &Path, name: &str) -> io::Result<()> {
     )
 }
 
-// ponytail: whole-page granularity; section-level three-way merge if pages grow large.
 fn reconcile(repo: &Path, name: &str, new: &str, report: &mut Report) -> io::Result<()> {
     let file = format!("{name}.mdx");
     let doc = repo.join("docs/doclify").join(&file);
@@ -99,6 +102,10 @@ fn reconcile(repo: &Path, name: &str, new: &str, report: &mut Report) -> io::Res
         report.unchanged.push(name);
     } else if baseline.as_deref() == Some(new) {
         report.kept_human.push(name);
+    } else if let Some(merged) = merge(repo, current.as_deref(), baseline.as_deref(), new)? {
+        write_atomic(&doc, merged.as_bytes())?;
+        write_atomic(&base, new.as_bytes())?;
+        report.merged.push(name);
     } else {
         write_atomic(&conflict, new.as_bytes())?;
         report.conflicts.push(name);
@@ -108,6 +115,33 @@ fn reconcile(repo: &Path, name: &str, new: &str, report: &mut Report) -> io::Res
     match fs::remove_file(conflict) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    }
+}
+
+/// Line-based three-way merge. `None` when edits overlap or there is no
+/// baseline (a page that predates Doclify is all human edit).
+fn merge(repo: &Path, current: Option<&str>, baseline: Option<&str>, new: &str) -> io::Result<Option<String>> {
+    let (Some(current), Some(baseline)) = (current, baseline) else { return Ok(None) };
+    let dir = repo.join(".doclify/conflicts");
+    let tmp = |tag: &str, text: &str| -> io::Result<std::path::PathBuf> {
+        let path = dir.join(format!(".merge-{}-{tag}.tmp", std::process::id()));
+        fs::write(&path, text)?;
+        Ok(path)
+    };
+    let files = [tmp("current", current)?, tmp("base", baseline)?, tmp("new", new)?];
+    let out = std::process::Command::new("git")
+        .arg("merge-file")
+        .arg("-p")
+        .args(&files)
+        .output();
+    for f in &files {
+        let _ = fs::remove_file(f);
+    }
+    let out = out?;
+    match out.status.code() {
+        Some(0) => String::from_utf8(out.stdout).map(Some).map_err(|e| crate::invalid(&e.to_string())),
+        Some(1..=127) => Ok(None),
+        _ => Err(io::Error::other(format!("git merge-file: {}", String::from_utf8_lossy(&out.stderr).trim()))),
     }
 }
 
@@ -284,6 +318,46 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
         &mut s,
         e.links.iter().map(|l| format!("{}: {} to {} ({})", basis(l.basis), code(&l.record), code(&short(&l.target)), esc(&l.reason))),
     );
+    s.push_str(
+        "\n## Test evidence\n\nObserved runs were seen through tool hooks; claims are what an agent said and were not observed. \
+         Each result covers only its command at its revision; uncommitted changes were not captured.\n\n",
+    );
+    list(
+        &mut s,
+        e.tests.iter().map(|t| {
+            format!(
+                "{}: {} ({}; {} session {}) at {}{}",
+                match t.source {
+                    TestSource::Observed => "Observed run",
+                    TestSource::Claimed => "Agent claim, not observed",
+                },
+                code(&t.scope),
+                match t.outcome {
+                    TestOutcome::Passed => "passed",
+                    TestOutcome::Failed => "failed",
+                    TestOutcome::Unknown => "outcome unknown",
+                },
+                esc(&t.agent),
+                code(&t.session),
+                t.revision.as_deref().map_or("unknown revision".into(), |r| code(&r[..r.len().min(12)])),
+                t.stale.as_ref().map_or(String::new(), |why| format!(" **Stale:** {}", esc(why))),
+            )
+        }),
+    );
+    s.push_str("\n## Session associations\n\nSuggested associations are inferred and unconfirmed.\n\n");
+    list(
+        &mut s,
+        e.sessions.iter().map(|l| {
+            format!(
+                "{}: {} session {} to {} ({})",
+                basis(l.basis),
+                esc(&l.agent),
+                code(&l.session),
+                code(&short(&format!("commit:{}", l.commit))),
+                esc(&l.reason)
+            )
+        }),
+    );
     s.push_str("\n## Branches\n\n");
     list(&mut s, e.branches.iter().map(|b| format!("{} at {}", code(&b.name), code(&b.head[..b.head.len().min(12)]))));
     s.push_str("\n## Recent commits\n\n");
@@ -298,12 +372,22 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
             &mut s,
             pull_requests.iter().map(|p| {
                 let reviews: Vec<String> = p.reviews.iter().map(|r| format!("{} {}", esc(&r.author), esc(&r.state))).collect();
+                let merged = match (&p.merged_at, &p.merged_by, &p.merge_commit) {
+                    (Some(at), by, commit) => format!(
+                        ", merged {}{}{}",
+                        esc(at),
+                        by.as_ref().map_or(String::new(), |b| format!(" by {}", esc(b))),
+                        commit.as_ref().map_or(String::new(), |c| format!(" as {}", code(&c[..c.len().min(12)]))),
+                    ),
+                    _ => String::new(),
+                };
                 format!(
-                    "#{} {} ({}{}; reviews: {}; comments: {}) {}",
+                    "#{} {} ({}{}; review decision: {}; reviews: {}; comments: {}) {}",
                     p.number,
                     esc(&p.title),
                     esc(&p.state),
-                    p.merged_at.as_ref().map_or(String::new(), |m| format!(", merged {}", esc(m))),
+                    merged,
+                    p.review_decision.as_deref().map_or("none".into(), esc),
                     if reviews.is_empty() { "none".into() } else { reviews.join(", ") },
                     p.comment_count,
                     esc(&p.url)
