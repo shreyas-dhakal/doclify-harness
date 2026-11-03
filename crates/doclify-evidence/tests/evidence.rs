@@ -208,6 +208,8 @@ fn human_edits_survive_regeneration() {
             provenance: vec![Provenance { source: "claude:s2".into(), excerpt: None }],
             evidence: vec![],
             supersedes: None,
+            scope: None,
+            session: None,
         })
         .unwrap();
     let r = docs::generate(repo, None).unwrap();
@@ -355,6 +357,8 @@ fn non_overlapping_human_edits_merge_with_regeneration() {
             provenance: vec![],
             evidence: vec![],
             supersedes: None,
+            scope: None,
+            session: None,
         })
         .unwrap();
     let r = docs::generate(repo, None).unwrap();

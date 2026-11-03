@@ -9,8 +9,7 @@ use doclify_domain::{
 use serde::Serialize;
 use std::{collections::BTreeMap, fs, io, path::Path};
 
-/// What the session is known to be about. Records carry no path scope yet, so
-/// scope only orders records by relevance; it never hides an accepted constraint.
+/// What the session is known to be about.
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
     pub branch: Option<String>,
@@ -113,6 +112,7 @@ pub fn build_merged(
     let mut constraints = Vec::new();
     let mut open = Vec::new();
     let mut unreadable = Vec::new();
+    let mut scoped_pointers = Vec::new();
     for (id, stores) in owners {
         let chosen = stores
             .iter()
@@ -127,6 +127,7 @@ pub fn build_merged(
                 Ok((history, store.accepted(&id)?))
             });
         let (history, accepted) = match chosen {
+
             Ok(v) => v,
             Err(_) => {
                 unreadable.push(id);
@@ -149,6 +150,11 @@ pub fn build_merged(
             .flatten()
             .any(|r| r.experiment_outcome == Some(ExperimentOutcome::Abandoned))
         {
+            continue;
+        }
+        let scoped_record = accepted.as_ref().unwrap_or(latest);
+        if !applicable(scoped_record, scope) {
+            scoped_pointers.push(id);
             continue;
         }
         let pending = (latest.review == ReviewState::Proposed).then_some(latest.version);
@@ -200,7 +206,7 @@ pub fn build_merged(
          Generated locally from Doclify records (no model call). {scope_line}\n\
          Rejected proposals and abandoned experiments are excluded. Full records: .doclify/records/<id>/; docs: docs/doclify/.\n"
     );
-    let mut omitted = Vec::new();
+    let mut omitted = scoped_pointers;
     let mut take =
         |items: Vec<(usize, String, String)>, max: usize, heading: &str, text: &mut String| {
             let mut body = String::new();
@@ -254,7 +260,7 @@ pub fn build_merged(
         let shown: Vec<&str> = omitted.iter().take(20).map(String::as_str).collect();
         let more = omitted.len() - shown.len();
         text += &format!(
-            "\nNot shown (size limit): {}{}\n",
+            "\nNot shown (scope or size limit; inspect records before relying on them): {}{}\n",
             shown.join(", "),
             if more > 0 {
                 format!(" and {more} more")
@@ -355,7 +361,49 @@ fn describe(scope: &Scope, ordered: bool) -> String {
             format!("{start} Ordered by {}.", given.join(" and "))
         };
     }
-    format!("Ordered by relevance to {}; records have no path scope yet, so all accepted constraints are repository-wide.", given.join(" and "))
+    format!(
+        "Ordered by relevance to {}; scoped records are included only when their scope matches.",
+        given.join(" and ")
+    )
+}
+
+fn applicable(record: &Record, scope: &Scope) -> bool {
+    let Some(record_scope) = &record.scope else {
+        return true;
+    };
+    if record_scope.branch.is_none() && record_scope.paths.is_empty() {
+        return true;
+    }
+    // A branch alone does not establish what task or paths are in scope.
+    let Some(topic) = scope.topic.as_deref() else {
+        return false;
+    };
+    if record_scope
+        .branch
+        .as_ref()
+        .is_some_and(|b| scope.branch.as_ref() != Some(b))
+    {
+        return false;
+    }
+    if !record_scope.paths.is_empty() {
+        let words = topic.split_whitespace().map(|w| {
+            w.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+            })
+        });
+        return words.into_iter().any(|word| {
+            record_scope.paths.iter().any(|path| {
+                word == path
+                    || word
+                        .strip_prefix(path)
+                        .is_some_and(|tail| tail.starts_with('/'))
+                    || path
+                        .strip_prefix(word)
+                        .is_some_and(|tail| !word.is_empty() && tail.starts_with('/'))
+            })
+        });
+    }
+    true
 }
 
 /// Lowercase words of 3+ chars from the topic and branch, minus branch noise.

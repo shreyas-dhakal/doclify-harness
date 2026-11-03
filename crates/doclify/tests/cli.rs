@@ -53,6 +53,8 @@ fn review_and_handoff_only_surface_accepted_decisions() {
         }],
         evidence: vec!["evidence-1".into()],
         supersedes: None,
+        scope: None,
+        session: None,
     };
     store.propose(&r).unwrap();
     let output = run(dir.path(), &["handoff"]);
@@ -533,6 +535,8 @@ fn repl_request_persists_proposal_for_explicit_review() {
             }],
             evidence: vec!["evidence-123".into()],
             supersedes: None,
+            scope: None,
+            session: None,
         })
         .unwrap();
     store.review("existing", 1, ReviewState::Accepted).unwrap();

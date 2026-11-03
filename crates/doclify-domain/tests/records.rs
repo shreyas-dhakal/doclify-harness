@@ -17,6 +17,8 @@ fn proposal() -> Record {
         }],
         evidence: vec!["evidence:session-1".into()],
         supersedes: None,
+        scope: None,
+        session: None,
     }
 }
 
@@ -170,4 +172,14 @@ fn reviewed_reversion_and_supersession_preserve_prior_versions() {
     assert_eq!(reviewed.implementation, ImplementationState::Reverted);
     assert_eq!(store.history(&revision.id).unwrap()[1], accepted);
     assert_eq!(store.accepted(&revision.id).unwrap().unwrap(), reviewed);
+}
+
+#[test]
+fn old_records_without_scope_or_session_deserialize() {
+    let mut value = serde_json::to_value(proposal()).unwrap();
+    value.as_object_mut().unwrap().remove("scope");
+    value.as_object_mut().unwrap().remove("session");
+    let restored: Record = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.scope, None);
+    assert_eq!(restored.session, None);
 }

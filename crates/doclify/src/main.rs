@@ -531,6 +531,8 @@ fn documentation_request(question: &str) -> Result<Value, Box<dyn std::error::Er
             }],
             evidence: proposal.evidence,
             supersedes: None,
+            scope: None,
+            session: None,
         };
         store.propose(&record)?;
         records.push(record);

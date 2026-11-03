@@ -334,6 +334,8 @@ pub fn process_proposals_locked(
                 }],
                 evidence: p.evidence,
                 supersedes,
+                scope: capture_scope(&event),
+                session: capture_session(&event),
             };
             if history.len() < record.version as usize {
                 store.propose(&record)?;
@@ -348,6 +350,59 @@ pub fn process_proposals_locked(
         count += 1;
     }
     Ok(count)
+}
+
+fn capture_scope(event: &Value) -> Option<doclify_domain::RecordScope> {
+    let origin = if event["source"] == "transcript" {
+        &event["context"]
+    } else {
+        &event["event"]
+    };
+    let branch = origin["branch"].as_str().map(str::to_owned);
+    let paths: Vec<String> = origin["payload"]["paths"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|p| {
+                    !p.is_empty() && !p.starts_with('/') && !p.split('/').any(|part| part == "..")
+                })
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if branch.is_none() && paths.is_empty() {
+        None
+    } else {
+        Some(doclify_domain::RecordScope { branch, paths })
+    }
+}
+
+fn capture_session(event: &Value) -> Option<doclify_domain::SessionAttribution> {
+    let origin = if event["source"] == "transcript" {
+        &event["context"]
+    } else {
+        &event["event"]
+    };
+    let payload = &origin["payload"];
+    let session_id = event["session_id"]
+        .as_str()
+        .or_else(|| payload["session_id"].as_str())
+        .map(str::to_owned);
+    let parent_session_id = event["raw"]["parent_session_id"]
+        .as_str()
+        .or_else(|| payload["parent_session_id"].as_str())
+        .map(str::to_owned);
+    if session_id.is_none() && parent_session_id.is_none() {
+        None
+    } else {
+        Some(doclify_domain::SessionAttribution {
+            worktree: origin["worktree"].as_str().map(str::to_owned),
+            session_id,
+            parent_session_id,
+        })
+    }
 }
 
 /// Scan session trees without following symlinks. Only sessions whose first
@@ -410,7 +465,7 @@ pub fn discover_sessions(
             {
                 continue;
             }
-            queue.reconcile_snapshot(&serde_json::json!({"agent": agent, "payload": {"session_id":session, "transcript_path":entry.path()}}), &[root], Some(&bytes))?;
+            queue.reconcile_snapshot(&serde_json::json!({"agent": agent, "worktree":repository, "branch":metadata["git"]["branch"], "payload": {"session_id":session, "parent_session_id":metadata["parent_session_id"], "transcript_path":entry.path()}}), &[root], Some(&bytes))?;
             count += 1;
         }
     }
@@ -595,4 +650,20 @@ pub fn spawn_worker<E: Extractor + Send + 'static>(
         }
     });
     (Worker { stop, thread }, status)
+}
+
+#[cfg(test)]
+mod scope_metadata_tests {
+    use super::*;
+    #[test]
+    fn transcript_metadata_preserves_child_and_origin_scope() {
+        let event = serde_json::json!({"source":"transcript", "session_id":"child", "raw":{}, "context":{"worktree":"/repo/worktree-a", "branch":"feature/a", "payload":{"parent_session_id":"parent", "paths":["src/auth", "../escape"]}}});
+        let scope = capture_scope(&event).unwrap();
+        assert_eq!(scope.branch.as_deref(), Some("feature/a"));
+        assert_eq!(scope.paths, ["src/auth"]);
+        let session = capture_session(&event).unwrap();
+        assert_eq!(session.worktree.as_deref(), Some("/repo/worktree-a"));
+        assert_eq!(session.session_id.as_deref(), Some("child"));
+        assert_eq!(session.parent_session_id.as_deref(), Some("parent"));
+    }
 }

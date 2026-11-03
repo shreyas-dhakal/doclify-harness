@@ -45,6 +45,20 @@ pub struct Provenance {
     pub source: String,
     pub excerpt: Option<String>,
 }
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordScope {
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttribution {
+    #[serde(default)]
+    pub worktree: Option<String>,
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub id: String,
@@ -59,6 +73,10 @@ pub struct Record {
     pub provenance: Vec<Provenance>,
     pub evidence: Vec<String>,
     pub supersedes: Option<u64>,
+    #[serde(default)]
+    pub scope: Option<RecordScope>,
+    #[serde(default)]
+    pub session: Option<SessionAttribution>,
 }
 #[derive(Serialize, Deserialize)]
 struct Envelope {

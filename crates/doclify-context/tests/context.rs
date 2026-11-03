@@ -36,6 +36,8 @@ fn record(id: &str, kind: RecordKind, title: &str) -> Record {
         provenance: vec![],
         evidence: vec![],
         supersedes: None,
+        scope: None,
+        session: None,
     }
 }
 
@@ -180,7 +182,7 @@ fn limits_bound_output_and_leave_pointers() {
         .iter()
         .all(|c| c.rationale.chars().count() <= limits.max_field_chars + 1));
     assert_eq!(ctx.constraints.len() + ctx.omitted.len(), 40);
-    assert!(ctx.render().contains("Not shown (size limit): decision-"));
+    assert!(ctx.render().contains("Not shown (scope or size limit; inspect records before relying on them): decision-"));
     assert!(ctx.render().contains("more"));
 }
 
@@ -383,4 +385,44 @@ fn merged_worktrees_keep_both_sides_and_resolve_collisions_deterministically() {
         "Tie, primary@2",
         "ties go to the earlier worktree"
     );
+}
+
+#[test]
+fn scoped_constraints_require_known_matching_task_and_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let repo = record("repo", RecordKind::Decision, "Repository rule");
+    let mut scoped = record("scoped", RecordKind::Decision, "Scoped rule");
+    scoped.scope = Some(doclify_domain::RecordScope {
+        branch: Some("feature/a".into()),
+        paths: vec!["src/auth".into()],
+    });
+    for r in [&repo, &scoped] {
+        store.propose(r).unwrap();
+        store.review(&r.id, 1, ReviewState::Accepted).unwrap();
+    }
+    for (topic, branch, expected) in [
+        (None, Some("feature/a"), false),
+        (Some("src/auth/login.rs"), Some("feature/b"), false),
+        (Some("src/other"), Some("feature/a"), false),
+        (Some("src/auth/login.rs"), Some("feature/a"), true),
+    ] {
+        let context = build(
+            dir.path(),
+            &Scope {
+                topic: topic.map(str::to_owned),
+                branch: branch.map(str::to_owned),
+            },
+            &Limits::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(context.constraints.iter().any(|c| c.id == "repo"));
+        assert_eq!(
+            context.constraints.iter().any(|c| c.id == "scoped"),
+            expected
+        );
+        assert_eq!(context.omitted.contains(&"scoped".to_string()), !expected);
+    }
+
 }
