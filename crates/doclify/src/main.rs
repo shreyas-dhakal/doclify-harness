@@ -71,13 +71,53 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             Ok(
                 json!({"registered": repo.queue_dir().is_dir(), "pending_events":count,
                 "pending_extraction":queue.pending()?.len(), "pending_review":pending,
-                "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?,
+                "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.common_dir.join("doclify/worker-error")).ok(),
                 "codex_hook_approval":"not verified"}),
             )
         }
         ["sync"] => {
-            let queue = Queue::open(repo.common_dir.join("doclify/jobs"))?;
+            let local = repo.common_dir.join("doclify");
+            fs::create_dir_all(&local)?;
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(local.join("worker.lock"))?;
+            lock.try_lock()
+                .map_err(|_| "another sync is already running")?;
+            let queue = Queue::open(local.join("jobs"))?;
+            let roots = session_roots();
+            let events = hook::pending(&repo.queue_dir())?;
+            for (_, event) in &events {
+                if let Some(path) = event
+                    .pointer("/payload/transcript_path")
+                    .and_then(Value::as_str)
+                {
+                    let agent = event["agent"].as_str().unwrap_or("");
+                    let canonical = std::path::Path::new(path)
+                        .canonicalize()
+                        .map_err(|_| "untrusted transcript path or file unavailable")?;
+                    if !roots.iter().any(|(name, root)| {
+                        name == agent && root.canonicalize().is_ok_and(|r| canonical.starts_with(r))
+                    }) {
+                        return Err("untrusted transcript path; captured hook retained".into());
+                    }
+                }
+            }
             let drained = queue.drain_hooks(&repo.queue_dir())?;
+            for (agent, root) in &roots {
+                doclify_pipeline::discover_sessions(&queue, &repo.worktree, agent, root)?;
+            }
+            let processed = match api_extractor(&repo)? {
+                Some(mut extractor) => Some(doclify_pipeline::process_proposals(
+                    &queue,
+                    &local.join("proposal-output"),
+                    &Store::open(&repo.worktree)?,
+                    &mut extractor,
+                )?),
+                None => None,
+            };
             let evidence = doclify_evidence::sync(
                 &repo.worktree,
                 &repo.common_dir.join("doclify"),
@@ -85,7 +125,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             )?;
             let docs = doclify_evidence::docs::generate(&repo.worktree, Some(&evidence))?;
             Ok(
-                json!({"reconciled_events":drained, "pending_extraction":queue.pending()?.len(),
+                json!({"reconciled_events":drained, "processed":processed, "pending_extraction":queue.pending()?.len(),
                 "commits":evidence.commits.len(), "github":evidence.github, "links":evidence.links, "docs":docs}),
             )
         }
@@ -184,6 +224,31 @@ fn repl() -> ExitCode {
     let mut input = stdin.lock();
     let mut stdout = io::stdout();
     println!("Doclify: /help for commands; /quit to exit");
+    let (stop, shutdown) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while matches!(
+            shutdown.recv_timeout(std::time::Duration::from_secs(60)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            if let Some(repo) = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| RepoInfo::discover(&cwd))
+            {
+                if !repo.queue_dir().is_dir() {
+                    continue;
+                }
+                let error_path = repo.common_dir.join("doclify/worker-error");
+                match run(&["sync".into()]) {
+                    Ok(_) => {
+                        let _ = fs::remove_file(error_path);
+                    }
+                    Err(e) => {
+                        let _ = fs::write(error_path, e.to_string());
+                    }
+                }
+            }
+        }
+    });
     loop {
         print!("doclify> ");
         if stdout.flush().is_err() {
@@ -244,6 +309,7 @@ fn repl() -> ExitCode {
             Err(e) => eprintln!("doclify: {e}"),
         }
     }
+    let _ = stop.send(());
     ExitCode::SUCCESS
 }
 
@@ -330,4 +396,55 @@ fn docs(background: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn session_roots() -> Vec<(String, std::path::PathBuf)> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return vec![];
+    };
+    let home = std::path::PathBuf::from(home);
+    [
+        ("claude", home.join(".claude/projects")),
+        ("codex", home.join(".codex/sessions")),
+    ]
+    .into_iter()
+    .filter(|(_, root)| root.is_dir())
+    .map(|(name, root)| (name.to_owned(), root))
+    .collect()
+}
+fn api_extractor(repo: &RepoInfo) -> io::Result<Option<doclify_pipeline::ApiExtractor>> {
+    use doclify_model_bridge::providers::{ApiKind, ApiProvider};
+    let Some(config) = load_config(repo)? else {
+        return Ok(None);
+    };
+    let kind = match config["provider"].as_str() {
+        Some("openai") => ApiKind::OpenAiCompatible,
+        Some("anthropic") => ApiKind::Anthropic,
+        Some("claude" | "codex") => return Ok(None),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid selected provider",
+            ))
+        }
+    };
+    let field = |name| {
+        config[name]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete model configuration")
+            })
+    };
+    let model = field("model")?;
+    Ok(Some(doclify_pipeline::ApiExtractor {
+        provider: ApiProvider {
+            kind,
+            base_url: field("base_url")?,
+            api_key_env: field("api_key_env")?,
+            models: vec![model.clone()],
+        },
+        model,
+    }))
 }
