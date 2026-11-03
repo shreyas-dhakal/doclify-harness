@@ -339,9 +339,9 @@ fn hooks_reach_existing_and_new_worktrees_without_touching_foreign_state() {
 
     capture(&dir, "install");
     for name in ["existing", "broken"] {
-        assert_eq!(ours(&codex(name)), 4, "{name}");
+        assert_eq!(ours(&codex(name)), 6, "{name}");
     }
-    assert_eq!(ours(&claude("existing")), 4);
+    assert_eq!(ours(&claude("existing")), 6);
     assert!(fs::read_to_string(codex("existing"))
         .unwrap()
         .contains("theirs"));
@@ -355,7 +355,7 @@ fn hooks_reach_existing_and_new_worktrees_without_touching_foreign_state() {
     let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
     let out = run_hook(&dir, "claude", start, &[]);
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
-    assert_eq!((ours(&claude("later")), ours(&codex("later"))), (4, 4));
+    assert_eq!((ours(&claude("later")), ours(&codex("later"))), (6, 6));
     let before = fs::read_to_string(claude("later")).unwrap();
     run_hook(&dir, "claude", start, &[]);
     assert_eq!(
@@ -375,9 +375,9 @@ fn hooks_reach_existing_and_new_worktrees_without_touching_foreign_state() {
     assert_eq!(restored(codex("existing")), foreign);
     run_hook(&wt("later"), "codex", start, &[]);
     assert_eq!(ours(&codex("existing")), 0);
-    assert_eq!(ours(&codex("later")), 4, "other worktrees keep their hooks");
+    assert_eq!(ours(&codex("later")), 6, "other worktrees keep their hooks");
     capture(&wt("existing"), "install");
-    assert_eq!(ours(&codex("existing")), 4, "install lifts the opt-out");
+    assert_eq!(ours(&codex("existing")), 6, "install lifts the opt-out");
 
     git(&dir, &["worktree", "prune"]);
     for name in ["existing", "broken", "later"] {

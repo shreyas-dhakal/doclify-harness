@@ -358,7 +358,8 @@ fn capture_scope(event: &Value) -> Option<doclify_domain::RecordScope> {
     } else {
         &event["event"]
     };
-    let branch = origin["branch"].as_str().map(str::to_owned);
+    // A session's branch is provenance, not proof that a claim is branch-scoped.
+    let branch = origin["payload"]["scope"]["branch"].as_str().map(str::to_owned);
     let paths: Vec<String> = origin["payload"]["paths"]
         .as_array()
         .map(|items| {
@@ -657,7 +658,7 @@ mod scope_metadata_tests {
     use super::*;
     #[test]
     fn transcript_metadata_preserves_child_and_origin_scope() {
-        let event = serde_json::json!({"source":"transcript", "session_id":"child", "raw":{}, "context":{"worktree":"/repo/worktree-a", "branch":"feature/a", "payload":{"parent_session_id":"parent", "paths":["src/auth", "../escape"]}}});
+        let event = serde_json::json!({"source":"transcript", "session_id":"child", "raw":{}, "context":{"worktree":"/repo/worktree-a", "branch":"feature/a", "payload":{"parent_session_id":"parent", "scope":{"branch":"feature/a"}, "paths":["src/auth", "../escape"]}}});
         let scope = capture_scope(&event).unwrap();
         assert_eq!(scope.branch.as_deref(), Some("feature/a"));
         assert_eq!(scope.paths, ["src/auth"]);
