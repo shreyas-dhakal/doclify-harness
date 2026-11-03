@@ -1,0 +1,11 @@
+[package]
+name = "doclify-pipeline"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+doclify-capture = { path = "../doclify-capture" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

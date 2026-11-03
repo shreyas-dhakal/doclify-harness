@@ -32,13 +32,20 @@ pub fn run(agent: Agent) -> io::Result<Option<PathBuf>> {
 pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Option<PathBuf>> {
     let payload: Value = serde_json::from_slice(raw)
         .unwrap_or_else(|_| json!({ "unparsed": String::from_utf8_lossy(raw) }));
-    let cwd = payload["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| fallback_cwd.to_path_buf());
-    let Some(repo) = RepoInfo::discover(&cwd) else { return Ok(None) };
+    let cwd = payload["cwd"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
+    let Some(repo) = RepoInfo::discover(&cwd) else {
+        return Ok(None);
+    };
     let dir = repo.queue_dir();
     if !dir.is_dir() {
         return Ok(None);
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let event = json!({
         "schema": SCHEMA,
         "agent": agent.name(),
@@ -49,7 +56,12 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
         "payload": payload,
     });
     // Unique and time-sortable; write-then-rename so readers never see partial files.
-    let name = format!("{:020}-{}-{}", now.as_nanos(), std::process::id(), agent.name());
+    let name = format!(
+        "{:020}-{}-{}",
+        now.as_nanos(),
+        std::process::id(),
+        agent.name()
+    );
     let tmp = dir.join(format!("{name}.tmp"));
     let path = dir.join(format!("{name}.json"));
     fs::write(&tmp, serde_json::to_vec(&event)?)?;
@@ -60,16 +72,18 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
 /// Queued events in arrival order. The worker deletes each file only after it
 /// has durably processed it, so a crash replays rather than loses events.
 pub fn pending(queue_dir: &Path) -> io::Result<Vec<(PathBuf, Value)>> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(queue_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
+    let mut paths = fs::read_dir(queue_dir)?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    paths.retain(|p| p.extension().is_some_and(|x| x == "json"));
     paths.sort();
-    Ok(paths
+    paths
         .into_iter()
-        .filter_map(|p| {
-            let v = serde_json::from_slice(&fs::read(&p).ok()?).ok()?;
-            Some((p, v))
+        .map(|p| {
+            let value = serde_json::from_slice(&fs::read(&p)?).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", p.display()))
+            })?;
+            Ok((p, value))
         })
-        .collect())
+        .collect()
 }
