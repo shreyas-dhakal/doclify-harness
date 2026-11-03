@@ -13,9 +13,55 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "hook") {
         if let Some(agent) = args.get(1).and_then(|a| Agent::parse(a)) {
-            let _ = hook::run(agent);
+            if let Ok(Some(path)) = hook::run(agent) {
+                if let Ok(bytes) = fs::read(path) {
+                    if let Ok(event) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(worktree) = event["worktree"].as_str() {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(exe)
+                                    .arg("background-worker")
+                                    .current_dir(worktree)
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                            }
+                        }
+                    }
+                }
+            }
         }
         return ExitCode::SUCCESS;
+    }
+    if args.first().is_some_and(|a| a == "background-worker") {
+        // Contending hook workers retry so the last event is not stranded.
+        for _ in 0..60 {
+            match run(&["sync".into()]) {
+                Ok(_) => {
+                    if let Some(repo) = std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| RepoInfo::discover(&cwd))
+                    {
+                        let _ = fs::remove_file(repo.common_dir.join("doclify/worker-error"));
+                    }
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) if e.to_string().contains("another sync is already running") => {
+                    std::thread::sleep(std::time::Duration::from_secs(1))
+                }
+                Err(e) => {
+                    if let Some(repo) = std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| RepoInfo::discover(&cwd))
+                    {
+                        let _ =
+                            fs::write(repo.common_dir.join("doclify/worker-error"), e.to_string());
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        return ExitCode::FAILURE;
     }
     if args.is_empty() {
         return repl();
@@ -84,8 +130,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 .create(true)
                 .truncate(false)
                 .open(local.join("worker.lock"))?;
-            lock.try_lock()
-                .map_err(|_| "another sync is already running")?;
+            lock.lock()?;
             let queue = Queue::open(local.join("jobs"))?;
             let roots = session_roots();
             let events = hook::pending(&repo.queue_dir())?;
@@ -105,11 +150,22 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                     }
                 }
             }
-            let drained = queue.drain_hooks(&repo.queue_dir())?;
+            let authorized_roots: Vec<&std::path::Path> =
+                roots.iter().map(|(_, root)| root.as_path()).collect();
+            let drained = queue.drain_hooks_with_roots(&repo.queue_dir(), &authorized_roots)?;
             for (agent, root) in &roots {
                 doclify_pipeline::discover_sessions(&queue, &repo.worktree, agent, root)?;
             }
-            let processed = match api_extractor(&repo)? {
+            let captured = captured_jobs(&local.join("jobs"))?;
+            let evidence = doclify_evidence::sync(
+                &repo.worktree,
+                &repo.common_dir.join("doclify"),
+                &doclify_evidence::SyncOptions {
+                    captured: &captured,
+                    ..Default::default()
+                },
+            )?;
+            let processed = match selected_extractor(&repo)? {
                 Some(mut extractor) => Some(doclify_pipeline::process_proposals(
                     &queue,
                     &local.join("proposal-output"),
@@ -118,11 +174,6 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 )?),
                 None => None,
             };
-            let evidence = doclify_evidence::sync(
-                &repo.worktree,
-                &repo.common_dir.join("doclify"),
-                &Default::default(),
-            )?;
             let docs = doclify_evidence::docs::generate(&repo.worktree, Some(&evidence))?;
             Ok(
                 json!({"reconciled_events":drained, "processed":processed, "pending_extraction":queue.pending()?.len(),
@@ -287,20 +338,49 @@ fn repl() -> ExitCode {
                     continue;
                 }
             }
-            println!("Choose claude or codex, or press Enter to cancel. For an API model use /model set openai|anthropic <url> <key-env> <model>.");
-            print!("model> ");
-            let _ = stdout.flush();
-            let mut choice = String::new();
-            if input.read_line(&mut choice).is_err() {
-                return ExitCode::FAILURE;
-            }
-            let choice = choice.trim();
-            if choice.is_empty() {
-                continue;
-            }
-            match run(&["model".into(), "set".into(), choice.into()]) {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
-                Err(e) => eprintln!("doclify: {e}"),
+            println!("Search models by name; enter a number or exact name to select, or blank to cancel. API models can be configured with /model set.");
+            let choices = ["claude", "codex"];
+            let mut shown = choices.to_vec();
+            loop {
+                for (i, choice) in shown.iter().enumerate() {
+                    println!("{}: {}", i + 1, choice);
+                }
+                print!("model search> ");
+                let _ = stdout.flush();
+                let mut query = String::new();
+                if input.read_line(&mut query).is_err() {
+                    return ExitCode::FAILURE;
+                }
+                let query = query.trim();
+                if query.is_empty() {
+                    break;
+                }
+                let selected = query
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| shown.get(i).copied())
+                    .or_else(|| {
+                        choices
+                            .iter()
+                            .copied()
+                            .find(|name| name.eq_ignore_ascii_case(query))
+                    });
+                if let Some(choice) = selected {
+                    match run(&["model".into(), "set".into(), choice.into()]) {
+                        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                        Err(e) => eprintln!("doclify: {e}"),
+                    }
+                    break;
+                }
+                shown = choices
+                    .iter()
+                    .copied()
+                    .filter(|name| name.contains(&query.to_lowercase()))
+                    .collect();
+                if shown.is_empty() {
+                    println!("No matches; enter another search.");
+                }
             }
             continue;
         }
@@ -412,7 +492,7 @@ fn session_roots() -> Vec<(String, std::path::PathBuf)> {
     .map(|(name, root)| (name.to_owned(), root))
     .collect()
 }
-fn api_extractor(repo: &RepoInfo) -> io::Result<Option<doclify_pipeline::ApiExtractor>> {
+fn selected_extractor(repo: &RepoInfo) -> io::Result<Option<doclify_pipeline::SelectedExtractor>> {
     use doclify_model_bridge::providers::{ApiKind, ApiProvider};
     let Some(config) = load_config(repo)? else {
         return Ok(None);
@@ -420,7 +500,19 @@ fn api_extractor(repo: &RepoInfo) -> io::Result<Option<doclify_pipeline::ApiExtr
     let kind = match config["provider"].as_str() {
         Some("openai") => ApiKind::OpenAiCompatible,
         Some("anthropic") => ApiKind::Anthropic,
-        Some("claude" | "codex") => return Ok(None),
+        Some(provider @ ("claude" | "codex")) => {
+            return Ok(Some(doclify_pipeline::SelectedExtractor::Cli(
+                doclify_pipeline::CliExtractor {
+                    bridge: if provider == "claude" {
+                        Bridge::claude("claude")
+                    } else {
+                        Bridge::codex("codex")
+                    },
+                    model: config["model"].as_str().map(str::to_owned),
+                    timeout: std::time::Duration::from_secs(120),
+                },
+            )))
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -438,13 +530,44 @@ fn api_extractor(repo: &RepoInfo) -> io::Result<Option<doclify_pipeline::ApiExtr
             })
     };
     let model = field("model")?;
-    Ok(Some(doclify_pipeline::ApiExtractor {
-        provider: ApiProvider {
-            kind,
-            base_url: field("base_url")?,
-            api_key_env: field("api_key_env")?,
-            models: vec![model.clone()],
+    Ok(Some(doclify_pipeline::SelectedExtractor::Api(
+        doclify_pipeline::ApiExtractor {
+            provider: ApiProvider {
+                kind,
+                base_url: field("base_url")?,
+                api_key_env: field("api_key_env")?,
+                models: vec![model.clone()],
+            },
+            model,
         },
-        model,
-    }))
+    )))
+}
+
+fn captured_jobs(root: &std::path::Path) -> io::Result<Vec<Value>> {
+    let mut jobs = Vec::new();
+    for name in ["pending", "done"] {
+        for entry in fs::read_dir(root.join(name))? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            jobs.push(serde_json::from_slice(&fs::read(entry.path())?)?);
+        }
+    }
+    Ok(jobs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_reads_pending_and_completed_capture_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["pending", "done"] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+            fs::write(dir.path().join(name).join("job"), br#"{"source":"hook"}"#).unwrap();
+        }
+        assert_eq!(captured_jobs(dir.path()).unwrap().len(), 2);
+    }
 }
