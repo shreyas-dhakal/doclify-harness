@@ -178,3 +178,6 @@ impl Bridge {
 
 /// Configured API providers and extraction proposal validation.
 pub mod providers;
+
+/// Structured documentation questions and proposed edits.
+pub mod documentation;
