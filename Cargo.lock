@@ -325,6 +325,7 @@ dependencies = [
  "doclify-model-bridge",
  "doclify-pipeline",
  "doclify-viewer",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
