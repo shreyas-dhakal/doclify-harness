@@ -34,10 +34,10 @@ pub fn validate_proposals(input: &str) -> Result<ProposalBatch, String> {
     Ok(batch)
 }
 
-fn schema() -> Value {
+pub fn proposal_schema() -> Value {
     json!({"type":"object","additionalProperties":false,"required":["proposals"],"properties":{"proposals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["kind","summary","review","evidence"],"properties":{"kind":{"type":"string","enum":["requirement","decision","experiment","question","task"]},"summary":{"type":"string"},"review":{"type":"string","enum":["proposed"]},"evidence":{"type":"array","items":{"type":"string"}}}}}}})
 }
-const INSTRUCTION: &str = "Extract documentation proposals from the supplied material. Return only JSON matching the schema. Cite supplied evidence identifiers; never accept a decision.";
+pub const INSTRUCTION: &str = "Extract documentation proposals from the supplied material. Return only JSON matching the schema. Cite supplied evidence identifiers; never accept a decision.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {
@@ -138,11 +138,11 @@ impl ApiProvider {
         let (suffix, body) = match self.kind {
             ApiKind::OpenAiCompatible => (
                 "chat/completions",
-                json!({"model":model,"messages":[{"role":"system","content":INSTRUCTION},{"role":"user","content":input}],"response_format":{"type":"json_schema","json_schema":{"name":"proposals","strict":true,"schema":schema()}}}),
+                json!({"model":model,"messages":[{"role":"system","content":INSTRUCTION},{"role":"user","content":input}],"response_format":{"type":"json_schema","json_schema":{"name":"proposals","strict":true,"schema":proposal_schema()}}}),
             ),
             ApiKind::Anthropic => (
                 "messages",
-                json!({"model":model,"max_tokens":4096,"system":format!("{} JSON schema: {}", INSTRUCTION, schema()),"messages":[{"role":"user","content":input}]}),
+                json!({"model":model,"max_tokens":4096,"system":format!("{} JSON schema: {}", INSTRUCTION, proposal_schema()),"messages":[{"role":"user","content":input}]}),
             ),
         };
         let v = Self::response(self.request(reqwest::Method::POST, suffix)?.json(&body))?;

@@ -234,3 +234,46 @@ fn background_worker_processes_queued_events() {
     );
     worker.stop();
 }
+
+#[cfg(unix)]
+#[test]
+fn selected_cli_extracts_proposals_and_unavailable_codex_keeps_work() {
+    use doclify_model_bridge::Bridge;
+    use doclify_pipeline::{CliExtractor, SelectedExtractor};
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("claude");
+    std::fs::write(&cli, r##"#!/bin/sh
+if [ "$1" = "--help" ]; then
+ echo '--print --output-format --json-schema --tools --restricted --safe-mode --strict-mcp-config --no-session-persistence --disable-slash-commands --permission-mode --permission-prompts'
+else
+ [ "$DOCLIFY_BRIDGE" = 1 ] || exit 9
+ cat >/dev/null
+ echo '{"structured_output":{"proposals":[]}}'
+fi
+"##).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    queue
+        .reconcile(&serde_json::json!({"agent":"codex","payload":{"session_id":"s"}}))
+        .unwrap();
+    let store = doclify_domain::Store::open(dir.path()).unwrap();
+    let out = dir.path().join("out");
+    let mut selected = SelectedExtractor::Cli(CliExtractor {
+        bridge: Bridge::codex(&cli),
+        model: None,
+        timeout: Duration::from_secs(2),
+    });
+    assert!(doclify_pipeline::process_proposals(&queue, &out, &store, &mut selected).is_err());
+    assert_eq!(queue.pending().unwrap().len(), 1);
+    selected = SelectedExtractor::Cli(CliExtractor {
+        bridge: Bridge::claude(&cli),
+        model: None,
+        timeout: Duration::from_secs(2),
+    });
+    assert_eq!(
+        doclify_pipeline::process_proposals(&queue, &out, &store, &mut selected).unwrap(),
+        1
+    );
+    assert!(queue.pending().unwrap().is_empty());
+}
