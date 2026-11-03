@@ -127,6 +127,7 @@ impl Bridge {
             cmd.arg("--model").arg(model);
         }
         cmd.env("DOCLIFY_GENERATED_SESSION", "1")
+            .env("DOCLIFY_BRIDGE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
