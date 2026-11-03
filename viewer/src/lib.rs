@@ -1,4 +1,5 @@
 //! Local documentation viewer. The host owns the returned server task and URL.
+#![allow(clippy::result_large_err)] // Handlers return axum Responses as errors.
 use axum::{
     body::Body,
     extract::Request,
@@ -9,6 +10,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
 use rand::{rngs::OsRng, RngCore};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -17,7 +22,6 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::Mutex;
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -26,7 +30,7 @@ struct Assets;
 pub struct Viewer {
     root: PathBuf,
     token: String,
-    lock: Arc<Mutex<()>>,
+    dir: Arc<Dir>,
 }
 #[derive(Clone)]
 struct App {
@@ -56,9 +60,9 @@ impl Viewer {
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
         Ok(Self {
+            dir: Arc::new(Dir::open_ambient_dir(&root, ambient_authority())?),
             root,
             token: bytes.iter().map(|b| format!("{b:02x}")).collect(),
-            lock: Arc::new(Mutex::new(())),
         })
     }
     pub fn token(&self) -> &str {
@@ -91,7 +95,9 @@ impl Viewer {
             tokio::spawn(async move { axum::serve(listener, app).await }),
         ))
     }
-    fn doc_path(&self, path: &str) -> Result<PathBuf, StatusCode> {
+    /// Opens the document's directory as a descriptor beneath the root opened at launch. Every
+    /// later access is relative to it, so a component swapped for a symlink cannot escape.
+    fn open_doc(&self, path: &str) -> Result<(Dir, Dir, String), StatusCode> {
         let rel = Path::new(path);
         if path.is_empty()
             || !rel.components().all(|c| matches!(c, Component::Normal(_)))
@@ -99,23 +105,82 @@ impl Viewer {
         {
             return Err(StatusCode::BAD_REQUEST);
         }
-        let base = self
-            .root
-            .join("docs/doclify")
-            .canonicalize()
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-        if !base.starts_with(&self.root) {
-            return Err(StatusCode::FORBIDDEN);
+        let not_found = |_| StatusCode::NOT_FOUND;
+        let docs = self.dir.open_dir("docs/doclify").map_err(not_found)?;
+        let dir = match rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => docs.open_dir(parent).map_err(not_found)?,
+            None => docs.try_clone().map_err(not_found)?,
+        };
+        let name = rel.file_name().unwrap().to_string_lossy().into_owned();
+        match dir.symlink_metadata(&name) {
+            Ok(m) if m.is_file() => Ok((docs, dir, name)),
+            Ok(_) => Err(StatusCode::FORBIDDEN),
+            Err(_) => Err(StatusCode::NOT_FOUND),
         }
-        let file = base
-            .join(rel)
-            .canonicalize()
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-        if !file.starts_with(&base) || !file.is_file() {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        Ok(file)
     }
+    /// Revision-checked atomic replace. An exclusive lock on the docs directory serializes viewer
+    /// tabs and processes; a writer that ignores it (an editor, git) is caught by the second check
+    /// unless it lands in the instant between that check and the rename.
+    fn write(&self, data: Save) -> Result<Json<Document>, Response> {
+        use std::io::Write;
+        let (docs, dir, name) = self
+            .open_doc(&data.path)
+            .map_err(IntoResponse::into_response)?;
+        let lock = docs.try_clone().map_err(internal)?.into_std_file();
+        lock.lock().map_err(internal)?;
+        let check = || -> Result<(), Response> {
+            let current = dir.read_to_string(&name).map_err(internal)?;
+            if revision(&current) == data.revision {
+                return Ok(());
+            }
+            Err((
+                StatusCode::CONFLICT,
+                Json(Document {
+                    path: data.path.clone(),
+                    revision: revision(&current),
+                    content: current,
+                }),
+            )
+                .into_response())
+        };
+        check()?;
+        let temp = format!(".{name}.{:016x}.tmp", OsRng.next_u64());
+        let result = (|| {
+            let mut file = dir
+                .open_with(&temp, OpenOptions::new().write(true).create_new(true))
+                .map_err(internal)?;
+            file.set_permissions(dir.metadata(&name).map_err(internal)?.permissions())
+                .map_err(internal)?;
+            file.write_all(data.content.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(internal)?;
+            check()?;
+            dir.rename(&temp, &dir, &name).map_err(internal)
+        })();
+        if result.is_err() {
+            let _ = dir.remove_file(&temp);
+        }
+        result?;
+        dir.try_clone()
+            .and_then(|d| d.into_std_file().sync_all())
+            .map_err(internal)?;
+        Ok(Json(Document {
+            path: data.path,
+            revision: revision(&data.content),
+            content: data.content,
+        }))
+    }
+}
+fn internal<E>(_: E) -> Response {
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+fn authorize(app: &App, headers: &HeaderMap) -> Result<(), StatusCode> {
+    if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(app.origin.as_str())
+        || headers.get("x-doclify-token").and_then(|v| v.to_str().ok()) != Some(app.viewer.token())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
 }
 async fn check_host(State(app): State<App>, request: Request, next: Next) -> Response {
     let expected = app.origin.strip_prefix("http://").unwrap_or("");
@@ -171,8 +236,10 @@ async fn read(
     State(app): State<App>,
     Query(q): Query<DocumentPath>,
 ) -> Result<Json<Document>, StatusCode> {
-    let file = app.viewer.doc_path(&q.path)?;
-    let content = std::fs::read_to_string(file).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (_, dir, name) = app.viewer.open_doc(&q.path)?;
+    let content = dir
+        .read_to_string(name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(Document {
         path: q.path,
         revision: revision(&content),
@@ -183,39 +250,12 @@ async fn save(
     State(app): State<App>,
     headers: HeaderMap,
     Json(data): Json<Save>,
-) -> Result<Json<Document>, StatusCode> {
-    if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(app.origin.as_str())
-        || headers.get("x-doclify-token").and_then(|v| v.to_str().ok()) != Some(app.viewer.token())
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let _guard = app.viewer.lock.lock().await;
-    let file = app.viewer.doc_path(&data.path)?;
-    let current = std::fs::read_to_string(&file).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if revision(&current) != data.revision {
-        return Err(StatusCode::CONFLICT);
-    }
-    use std::io::Write;
-    let mut temp =
-        tempfile::NamedTempFile::new_in(file.parent().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    temp.as_file()
-        .set_permissions(
-            std::fs::metadata(&file)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .permissions(),
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    temp.write_all(data.content.as_bytes())
-        .and_then(|_| temp.as_file().sync_all())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    temp.persist(file)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(Document {
-        path: data.path,
-        revision: revision(&data.content),
-        content: data.content,
-    }))
+) -> Result<Json<Document>, Response> {
+    authorize(&app, &headers).map_err(IntoResponse::into_response)?;
+    let viewer = app.viewer.clone();
+    tokio::task::spawn_blocking(move || viewer.write(data))
+        .await
+        .map_err(internal)?
 }
 async fn records(State(app): State<App>) -> Result<Json<Vec<doclify_domain::Record>>, StatusCode> {
     let base = app.viewer.root.join(".doclify/records");
@@ -260,18 +300,14 @@ async fn review(
     headers: HeaderMap,
     Json(data): Json<Review>,
 ) -> Result<Json<doclify_domain::Record>, StatusCode> {
-    if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(app.origin.as_str())
-        || headers.get("x-doclify-token").and_then(|v| v.to_str().ok()) != Some(app.viewer.token())
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    authorize(&app, &headers)?;
     let state = match data.action.as_str() {
         "accept" => doclify_domain::ReviewState::Accepted,
         "reject" => doclify_domain::ReviewState::Rejected,
         "supersede" => doclify_domain::ReviewState::Superseded,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
-    let _guard = app.viewer.lock.lock().await;
+    // Store appends with an exclusive hard link, so concurrent reviews of one version cannot both win.
     let base = app.viewer.root.join(".doclify/records");
     if !base
         .canonicalize()
