@@ -208,10 +208,9 @@ fn sync_rejects_untrusted_transcript_path_without_removing_hook() {
     .unwrap();
     assert!(hook.wait().unwrap().success());
     let out = run(dir.path(), &["sync"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("untrusted transcript"));
+    assert!(out.status.success());
     assert_eq!(
-        fs::read_dir(dir.path().join(".git/doclify/queue"))
+        fs::read_dir(dir.path().join(".git/doclify/queue/rejected"))
             .unwrap()
             .count(),
         1
@@ -347,4 +346,83 @@ fn repl_filters_model_picker_and_selects_match() {
     let model: serde_json::Value =
         serde_json::from_slice(&run(dir.path(), &["model"]).stdout).unwrap();
     assert_eq!(model["selected"]["provider"], "codex");
+}
+
+#[test]
+fn sync_processes_valid_transcript_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(run(dir.path(), &["init"]).status.success());
+    let sessions = home.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let transcript = sessions.join("session.jsonl");
+    fs::write(&transcript, format!("{}\n{}\n", serde_json::json!({"type":"session_meta","payload":{"id":"s","cwd":dir.path()}}), serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}))).unwrap();
+    doclify_capture::hook::enqueue(doclify_capture::Agent::Codex, serde_json::json!({"cwd":dir.path(),"session_id":"s","transcript_path":transcript}).to_string().as_bytes(), dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .arg("sync")
+        .current_dir(dir.path())
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(dir.path().join(".git/doclify/queue"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(
+        fs::read_dir(dir.path().join(".git/doclify/jobs/pending"))
+            .unwrap()
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn sync_waits_for_the_background_worker_queue_lock() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap();
+    assert!(run(dir.path(), &["init"]).status.success());
+    let queue = doclify_capture::queue::Queue::open(dir.path().join(".git/doclify/jobs")).unwrap();
+    let held = queue.lock().unwrap();
+    let mut sync = Command::new(env!("CARGO_BIN_EXE_doclify")).arg("sync").current_dir(dir.path()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(sync.try_wait().unwrap().is_none());
+    drop(held);
+    assert!(sync.wait().unwrap().success());
+}
+
+#[test]
+fn linked_worktrees_keep_capture_queues_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let other = dir.path().join("other");
+    fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| Command::new("git").args(args).current_dir(&repo).status().unwrap();
+    assert!(git(&["init", "-q"]).success());
+    assert!(git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "base"]).success());
+    assert!(git(&["worktree", "add", "-qb", "other", other.to_str().unwrap()]).success());
+    assert!(run(&repo, &["init"]).status.success());
+    assert!(run(&other, &["init"]).status.success());
+    doclify_capture::hook::enqueue(doclify_capture::Agent::Codex, br#"{"message":"other worktree"}"#, &other).unwrap();
+    assert!(run(&repo, &["sync"]).status.success());
+    let other_info = doclify_capture::RepoInfo::discover(&other).unwrap();
+    assert_eq!(doclify_capture::hook::pending(&other_info.queue_dir()).unwrap().len(), 1);
+    assert!(run(&other, &["sync"]).status.success());
+    assert!(doclify_capture::hook::pending(&other_info.queue_dir()).unwrap().is_empty());
+    let main_info = doclify_capture::RepoInfo::discover(&repo).unwrap();
+    assert_ne!(main_info.git_dir, other_info.git_dir);
+    assert!(doclify_capture::queue::Queue::open(main_info.git_dir.join("doclify/jobs")).unwrap().pending().unwrap().is_empty());
+    assert_eq!(doclify_capture::queue::Queue::open(other_info.git_dir.join("doclify/jobs")).unwrap().pending().unwrap().len(), 1);
 }

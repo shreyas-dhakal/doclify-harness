@@ -113,9 +113,15 @@ fn worker_lock_serializes_independent_queue_handles() {
 fn changed_discovery_snapshot_is_not_processed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
-    fs::write(&path, "{\"type\":\"user\",\"message\":{\"content\":\"new\"}}\n").unwrap();
+    fs::write(
+        &path,
+        "{\"type\":\"user\",\"message\":{\"content\":\"new\"}}\n",
+    )
+    .unwrap();
     let queue = Queue::open(dir.path().join("queue")).unwrap();
     let event = json!({"agent":"claude","payload":{"session_id":"s","transcript_path":path}});
-    assert!(queue.reconcile_snapshot(&event, &[dir.path()], Some(b"old\n")).is_err());
-    assert_eq!(queue.pending().unwrap().len(), 1);
+    assert!(queue
+        .reconcile_snapshot(&event, &[dir.path()], Some(b"old\n"))
+        .is_err());
+    assert!(queue.pending().unwrap().is_empty());
 }

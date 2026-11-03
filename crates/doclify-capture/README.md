@@ -6,7 +6,7 @@ Verified against Codex CLI 0.166.0 and Claude Code 2.1.308 (2026-11-03).
 
 ## How it works
 
-- `doclify-capture install` (inside a repo) creates `<git-common-dir>/doclify/queue/` (this marks the repo as registered, is shared by all worktrees, and is never tracked) and adds hooks for `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` to:
+- `doclify-capture install` (inside a repo) creates `<git-dir>/doclify/queue/` (this marks that worktree as registered and is never tracked) and adds hooks for `SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStop` to:
   - Claude: `.claude/settings.local.json` (personal, not committed)
   - Codex: `.codex/hooks.json` (project hooks)
 - Each hook runs `doclify-capture hook <agent>`, which writes one JSON file per event (`{schema, agent, received_at_ms, worktree, branch, head, payload}`) via write-then-rename. On `SessionStart` (startup, resume, clear, compact) the hook also prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":…}}` built from `.doclify/records` by `doclify-context`; every other event prints nothing. The exit status is always 0, and no model is called. A missing binary is absorbed by the shell wrapper.
@@ -27,3 +27,5 @@ Verified against Codex CLI 0.166.0 and Claude Code 2.1.308 (2026-11-03).
 - Transcript formats are undocumented. Unknown line types are reported in `unsupported`, not dropped silently. Run the opt-in check against real files after agent upgrades:
   `DOCLIFY_REAL_CODEX=<rollout.jsonl> DOCLIFY_REAL_CLAUDE=<session.jsonl> cargo test -- --ignored`
 - Not yet implemented: the reconciliation scan of `~/.codex/sessions` and `~/.claude/projects` for sessions whose hooks never fired, and parent-session linkage. Subagent transcripts are captured only through `agent_transcript_path` in the raw payload.
+
+Linked worktrees have separate hook queues, jobs, checkpoints, and extraction outputs under their own Git directories; run `doclify init` in each worktree. Older shared queues and jobs remain in the common Git directory and are not automatically reassigned to linked worktrees; inspect them before manually recovering any pending work. Rejected hook files are retained in the worktree queue’s `rejected` directory and counted by `status` and `sync`.

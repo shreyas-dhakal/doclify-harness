@@ -42,7 +42,7 @@ fn main() -> ExitCode {
                         .ok()
                         .and_then(|cwd| RepoInfo::discover(&cwd))
                     {
-                        let _ = fs::remove_file(repo.common_dir.join("doclify/worker-error"));
+                        let _ = fs::remove_file(repo.git_dir.join("doclify/worker-error"));
                     }
                     return ExitCode::SUCCESS;
                 }
@@ -55,7 +55,7 @@ fn main() -> ExitCode {
                         .and_then(|cwd| RepoInfo::discover(&cwd))
                     {
                         let _ =
-                            fs::write(repo.common_dir.join("doclify/worker-error"), e.to_string());
+                            fs::write(repo.git_dir.join("doclify/worker-error"), e.to_string());
                     }
                     return ExitCode::FAILURE;
                 }
@@ -98,7 +98,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
         }
         ["uninstall"] => Ok(json!({"removed":install::uninstall(&repo.worktree)?})),
         ["status"] => {
-            let queue = Queue::open(repo.common_dir.join("doclify/jobs"))?;
+            let queue = Queue::open(repo.git_dir.join("doclify/jobs"))?;
             let count = if repo.queue_dir().is_dir() {
                 hook::pending(&repo.queue_dir())?.len()
             } else {
@@ -113,60 +113,41 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                     }
                 }
             }
-            let evidence = doclify_evidence::load(&repo.common_dir.join("doclify"))?;
+            let evidence = doclify_evidence::load(&repo.git_dir.join("doclify"))?;
             Ok(
-                json!({"registered": repo.queue_dir().is_dir(), "pending_events":count,
+                json!({"registered": repo.queue_dir().is_dir(), "pending_events":count, "rejected_events":rejected_count(&repo.queue_dir())?,
                 "pending_extraction":queue.pending()?.len(), "pending_review":pending,
-                "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.common_dir.join("doclify/worker-error")).ok(),
+                "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.git_dir.join("doclify/worker-error")).ok(),
                 "codex_hook_approval":"not verified"}),
             )
         }
         ["sync"] => {
-            let local = repo.common_dir.join("doclify");
+            let local = repo.git_dir.join("doclify");
             fs::create_dir_all(&local)?;
-            let lock = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(local.join("worker.lock"))?;
-            lock.lock()?;
             let queue = Queue::open(local.join("jobs"))?;
+            let _lock = queue.lock()?;
             let roots = session_roots();
-            let events = hook::pending(&repo.queue_dir())?;
-            for (_, event) in &events {
-                if let Some(path) = event
-                    .pointer("/payload/transcript_path")
-                    .and_then(Value::as_str)
-                {
-                    let agent = event["agent"].as_str().unwrap_or("");
-                    let canonical = std::path::Path::new(path)
-                        .canonicalize()
-                        .map_err(|_| "untrusted transcript path or file unavailable")?;
-                    if !roots.iter().any(|(name, root)| {
-                        name == agent && root.canonicalize().is_ok_and(|r| canonical.starts_with(r))
-                    }) {
-                        return Err("untrusted transcript path; captured hook retained".into());
-                    }
-                }
-            }
-            let authorized_roots: Vec<&std::path::Path> =
-                roots.iter().map(|(_, root)| root.as_path()).collect();
-            let drained = queue.drain_hooks_with_roots(&repo.queue_dir(), &authorized_roots)?;
-            for (agent, root) in &roots {
-                doclify_pipeline::discover_sessions(&queue, &repo.worktree, agent, root)?;
-            }
+            let sessions: Vec<_> = roots
+                .iter()
+                .map(|(agent, root)| (agent.as_str(), root.as_path()))
+                .collect();
+            let drained = doclify_pipeline::reconcile_repository_locked(
+                &queue,
+                &repo.queue_dir(),
+                &repo.worktree,
+                &sessions,
+            )?;
             let captured = captured_jobs(&local.join("jobs"))?;
             let evidence = doclify_evidence::sync(
                 &repo.worktree,
-                &repo.common_dir.join("doclify"),
+                &local,
                 &doclify_evidence::SyncOptions {
                     captured: &captured,
                     ..Default::default()
                 },
             )?;
             let processed = match selected_extractor(&repo)? {
-                Some(mut extractor) => Some(doclify_pipeline::process_proposals(
+                Some(mut extractor) => Some(doclify_pipeline::process_proposals_locked(
                     &queue,
                     &local.join("proposal-output"),
                     &Store::open(&repo.worktree)?,
@@ -176,7 +157,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             };
             let docs = doclify_evidence::docs::generate(&repo.worktree, Some(&evidence))?;
             Ok(
-                json!({"reconciled_events":drained, "processed":processed, "pending_extraction":queue.pending()?.len(),
+                json!({"reconciled_events":drained, "rejected_events":rejected_count(&repo.queue_dir())?, "processed":processed, "pending_extraction":queue.pending()?.len(),
                 "commits":evidence.commits.len(), "github":evidence.github, "links":evidence.links, "docs":docs}),
             )
         }
@@ -288,7 +269,7 @@ fn repl() -> ExitCode {
                 if !repo.queue_dir().is_dir() {
                     continue;
                 }
-                let error_path = repo.common_dir.join("doclify/worker-error");
+                let error_path = repo.git_dir.join("doclify/worker-error");
                 match run(&["sync".into()]) {
                     Ok(_) => {
                         let _ = fs::remove_file(error_path);
@@ -475,6 +456,14 @@ fn docs(background: bool) -> ExitCode {
             eprintln!("doclify: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn rejected_count(hook_dir: &std::path::Path) -> io::Result<usize> {
+    match fs::read_dir(hook_dir.join("rejected")) {
+        Ok(entries) => Ok(entries.count()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
     }
 }
 

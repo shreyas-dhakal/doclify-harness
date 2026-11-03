@@ -36,12 +36,13 @@ impl Agent {
     }
 }
 
-/// Git location of a working directory. `common_dir` is shared by all
-/// worktrees, so local capture state lives there and is never tracked.
+/// Git locations for a working directory. Capture state uses `git_dir` so
+/// linked worktrees do not consume each other’s events or proposal jobs.
 #[derive(Debug, Clone)]
 pub struct RepoInfo {
     pub worktree: PathBuf,
     pub common_dir: PathBuf,
+    pub git_dir: PathBuf,
     pub branch: Option<String>,
     pub head: Option<String>,
 }
@@ -49,20 +50,37 @@ pub struct RepoInfo {
 impl RepoInfo {
     pub fn discover(cwd: &Path) -> Option<RepoInfo> {
         let git = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(cwd).args(args).output().ok()
+            Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .ok()
         };
         // One process for everything; falls back when HEAD is unborn.
-        let full = git(&["rev-parse", "--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD", "HEAD"])?;
+        let full = git(&[
+            "rev-parse",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--abbrev-ref",
+            "HEAD",
+            "HEAD",
+        ])?;
         let out = if full.status.success() {
             full
         } else {
-            git(&["rev-parse", "--show-toplevel", "--git-common-dir"]).filter(|o| o.status.success())?
+            git(&["rev-parse", "--show-toplevel", "--git-common-dir"])
+                .filter(|o| o.status.success())?
         };
         let text = String::from_utf8(out.stdout).ok()?;
         let mut lines = text.lines();
         let worktree = PathBuf::from(lines.next()?);
         let common = PathBuf::from(lines.next()?);
-        let common_dir = if common.is_absolute() { common } else { cwd.join(common) };
+        let common_dir = if common.is_absolute() {
+            common
+        } else {
+            cwd.join(common)
+        };
         let mut branch = lines.next().filter(|b| *b != "HEAD").map(str::to_owned);
         let head = lines.next().map(str::to_owned);
         if head.is_none() {
@@ -72,12 +90,23 @@ impl RepoInfo {
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty());
         }
-        Some(RepoInfo { worktree, common_dir, branch, head })
+        let git_dir_out = git(&["rev-parse", "--absolute-git-dir"])?;
+        if !git_dir_out.status.success() {
+            return None;
+        }
+        let git_dir = PathBuf::from(String::from_utf8(git_dir_out.stdout).ok()?.trim());
+        Some(RepoInfo {
+            worktree,
+            common_dir,
+            git_dir,
+            branch,
+            head,
+        })
     }
 
     /// Existence of this directory is what "registered repository" means for capture.
     pub fn queue_dir(&self) -> PathBuf {
-        self.common_dir.join("doclify").join("queue")
+        self.git_dir.join("doclify").join("queue")
     }
 }
 

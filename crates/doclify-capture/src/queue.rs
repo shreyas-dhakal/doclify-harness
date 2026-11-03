@@ -58,11 +58,13 @@ impl Queue {
         let agent = Agent::parse(agent_name).ok_or_else(|| invalid("unsupported agent"))?;
         let raw = serde_json::to_vec(event)?;
         let event_id = digest(&raw);
-        atomic_write(&self.root.join("events").join(&event_id), &raw)?;
-        self.enqueue(&event_id, &json!({"source":"hook", "event":event}))?;
         let payload = &event["payload"];
+        if !payload.is_object() || (payload.get("transcript_path").is_some() && !payload["transcript_path"].is_string()) {
+            return Err(invalid("invalid hook payload"));
+        }
         let Some(path) = payload["transcript_path"].as_str() else {
-            return Ok(());
+            atomic_write(&self.root.join("events").join(&event_id), &raw)?;
+            return self.enqueue(&event_id, &json!({"source":"hook", "event":event}));
         };
         let session = payload["session_id"]
             .as_str()
@@ -113,6 +115,8 @@ impl Queue {
                 read.unsupported.join(", ")
             )));
         }
+        atomic_write(&self.root.join("events").join(&event_id), &raw)?;
+        self.enqueue(&event_id, &json!({"source":"hook", "event":event}))?;
         for entry in read.entries {
             let identity = entry.id.clone().unwrap_or_else(|| {
                 format!(

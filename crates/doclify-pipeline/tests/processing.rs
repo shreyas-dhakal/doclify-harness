@@ -309,6 +309,38 @@ fn hook_cannot_import_another_repositorys_transcript() {
         &store,
         &mut Provider { fail: true },
     );
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(result.unwrap(), 0);
+    assert!(hooks.join("rejected/event.json").exists());
     assert!(queue.pending().unwrap().is_empty());
+}
+
+#[test]
+fn malformed_hook_does_not_block_later_valid_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let hooks = dir.path().join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(hooks.join("01.json"), b"{").unwrap();
+    std::fs::write(hooks.join("02.json"), br#"{"agent":"codex","payload":{}}"#).unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    let store = doclify_domain::Store::open(dir.path()).unwrap();
+    struct Empty;
+    impl Extractor for Empty {
+        fn extract(&mut self, _: &Value) -> io::Result<Value> {
+            Ok(serde_json::json!({"proposals":[]}))
+        }
+    }
+    assert_eq!(
+        doclify_pipeline::run_once(
+            &queue,
+            &hooks,
+            dir.path(),
+            &[],
+            &dir.path().join("out"),
+            &store,
+            &mut Empty
+        )
+        .unwrap(),
+        1
+    );
+    assert!(hooks.join("rejected/01.json").exists());
 }
