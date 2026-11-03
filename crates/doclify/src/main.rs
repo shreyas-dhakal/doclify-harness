@@ -1,5 +1,7 @@
+use doclify_capture::queue::Queue;
 use doclify_capture::{hook, install, Agent, RepoInfo};
-use doclify_domain::{ExperimentOutcome, RecordKind, ReviewState, Store};
+use doclify_domain::{ReviewState, Store};
+use doclify_model_bridge::{Bridge, Capability};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -17,6 +19,9 @@ fn main() -> ExitCode {
     }
     if args.is_empty() {
         return repl();
+    }
+    if args.first().is_some_and(|a| a == "docs") {
+        return docs(false);
     }
     match run(&args) {
         Ok(v) => {
@@ -42,20 +47,13 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             let paths = install::install(&repo, "doclify")?;
             Store::open(&repo.worktree)?;
             Ok(
-                json!({"installed": paths, "notice":"Codex requires project trust and hook approval; capture processing is not yet implemented."}),
+                json!({"installed": paths, "notice":"Codex requires project trust and hook approval."}),
             )
         }
         ["uninstall"] => Ok(json!({"removed":install::uninstall(&repo.worktree)?})),
         ["status"] => {
-            let queue = repo.queue_dir();
-            let count = if queue.is_dir() {
-                fs::read_dir(queue)?
-                    .filter_map(Result::ok)
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-                    .count()
-            } else {
-                0
-            };
+            let queue = Queue::open(repo.common_dir.join("doclify/jobs"))?;
+            let count = hook::pending(&repo.queue_dir())?.len();
             let store = Store::open(&repo.worktree)?;
             let mut pending = Vec::new();
             for id in ids(&repo)? {
@@ -65,8 +63,53 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                     }
                 }
             }
+            let evidence = doclify_evidence::load(&repo.common_dir.join("doclify"))?;
             Ok(
-                json!({"registered":repo.queue_dir().is_dir(), "pending_events":count,"pending_review":pending,"capture_processing":"not implemented", "codex_hook_approval":"not verified"}),
+                json!({"registered": repo.queue_dir().is_dir(), "pending_events":count,
+                "pending_extraction":queue.pending()?.len(), "pending_review":pending,
+                "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?,
+                "codex_hook_approval":"not verified"}),
+            )
+        }
+        ["sync"] => {
+            let queue = Queue::open(repo.common_dir.join("doclify/jobs"))?;
+            let drained = queue.drain_hooks(&repo.queue_dir())?;
+            let evidence = doclify_evidence::sync(
+                &repo.worktree,
+                &repo.common_dir.join("doclify"),
+                &Default::default(),
+            )?;
+            let docs = doclify_evidence::docs::generate(&repo.worktree, Some(&evidence))?;
+            Ok(
+                json!({"reconciled_events":drained, "pending_extraction":queue.pending()?.len(),
+                "commits":evidence.commits.len(), "github":evidence.github, "links":evidence.links, "docs":docs}),
+            )
+        }
+        ["model"] | ["model", "list"] => model_list(&repo),
+        ["model", "set", provider, url, key_env, model]
+            if *provider == "openai" || *provider == "anthropic" =>
+        {
+            if model.trim().is_empty() || key_env.trim().is_empty() {
+                return Err("model and credential environment variable are required".into());
+            }
+            let selected =
+                json!({"provider":provider,"base_url":url,"api_key_env":key_env,"model":model});
+            save_config(&repo, &selected)?;
+            Ok(json!({"selected":selected,"authentication":"unverified"}))
+        }
+        ["model", "set", provider] if *provider == "claude" || *provider == "codex" => {
+            let selected = json!({"provider":provider});
+            save_config(&repo, &selected)?;
+            Ok(json!({"selected":selected,"authentication":"unverified"}))
+        }
+        ["doctor"] => {
+            let models = model_list(&repo)?;
+            Ok(
+                json!({"repository":repo.worktree,"registered":repo.queue_dir().is_dir(),
+                "hooks":{"claude":install::config_path(&repo.worktree, Agent::Claude).exists(),
+                         "codex":install::config_path(&repo.worktree, Agent::Codex).exists(),
+                         "codex_approval":"unverified"},"models":models,
+                "capture_compatibility":"transcript formats are checked during sync"}),
             )
         }
         ["review", id, version, action] => {
@@ -82,28 +125,22 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 state,
             )?)?)
         }
-        ["handoff"] => {
+        ["handoff"] => handoff(&repo, None),
+        ["handoff", topic @ ..] => handoff(&repo, Some(topic.join(" "))),
+        ["review"] => {
             let store = Store::open(&repo.worktree)?;
-            let mut accepted = Vec::new();
-            let mut open_work = Vec::new();
+            let mut pending = Vec::new();
             for id in ids(&repo)? {
-                if let Some(r) = store.accepted(&id)? {
-                    if r.experiment_outcome == Some(ExperimentOutcome::Abandoned) {
-                        continue;
-                    }
-                    if matches!(r.kind, RecordKind::Requirement | RecordKind::Decision) {
-                        accepted.push(r);
-                    } else if matches!(r.kind, RecordKind::Question | RecordKind::Task) {
-                        open_work.push(r);
+                if let Some(r) = store.history(&id)?.last() {
+                    if r.review == ReviewState::Proposed {
+                        pending.push(r.clone());
                     }
                 }
             }
-            Ok(
-                json!({"accepted_constraints":accepted,"open_work":open_work,"scope":"repository-wide; relevance is not inferred"}),
-            )
+            Ok(json!({"pending_review":pending}))
         }
         ["help"] => Ok(
-            json!({"commands":["init", "uninstall", "status", "review <id> <version> <accept|reject|supersede>", "handoff", "help", "quit"]}),
+            json!({"commands":["init", "uninstall", "status", "sync", "doctor", "model [list|set claude|codex|set openai|anthropic <url> <key-env> <model>]", "review [<id> <version> <accept|reject|supersede>]", "docs", "handoff [topic]", "help", "quit"]}),
         ),
         _ => Err("unknown command; run doclify help".into()),
     }
@@ -129,27 +166,153 @@ fn ids(repo: &RepoInfo) -> io::Result<Vec<String>> {
 }
 fn repl() -> ExitCode {
     let stdin = io::stdin();
+    let mut input = stdin.lock();
     let mut stdout = io::stdout();
-    println!("Doclify: /help for commands");
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
+    println!("Doclify: /help for commands; /quit to exit");
+    loop {
+        print!("doclify> ");
+        if stdout.flush().is_err() {
             return ExitCode::FAILURE;
-        };
-        let parts: Vec<String> = line
-            .split_whitespace()
-            .map(|s| s.trim_start_matches('/').to_owned())
-            .collect();
+        }
+        let mut line = String::new();
+        match input.read_line(&mut line) {
+            Ok(0) => break,
+            Err(_) => return ExitCode::FAILURE,
+            _ => {}
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with('/') {
+            eprintln!("Documentation questions and edits require an inference integration; use /help for available commands.");
+            continue;
+        }
+        let parts: Vec<String> = line[1..].split_whitespace().map(str::to_owned).collect();
         if parts.is_empty() {
             continue;
         }
-        if parts[0] == "quit" {
+        if parts[0] == "quit" || parts[0] == "exit" {
             break;
+        }
+        if parts[0] == "docs" {
+            docs(true);
+            continue;
+        }
+        if parts.len() == 1 && parts[0] == "model" {
+            match run(&parts) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                Err(e) => {
+                    eprintln!("doclify: {e}");
+                    continue;
+                }
+            }
+            println!("Choose claude or codex, or press Enter to cancel. For an API model use /model set openai|anthropic <url> <key-env> <model>.");
+            print!("model> ");
+            let _ = stdout.flush();
+            let mut choice = String::new();
+            if input.read_line(&mut choice).is_err() {
+                return ExitCode::FAILURE;
+            }
+            let choice = choice.trim();
+            if choice.is_empty() {
+                continue;
+            }
+            match run(&["model".into(), "set".into(), choice.into()]) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+                Err(e) => eprintln!("doclify: {e}"),
+            }
+            continue;
         }
         match run(&parts) {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
             Err(e) => eprintln!("doclify: {e}"),
         }
-        let _ = stdout.flush();
     }
     ExitCode::SUCCESS
+}
+
+fn config_path(repo: &RepoInfo) -> std::path::PathBuf {
+    repo.common_dir.join("doclify/model.json")
+}
+fn load_config(repo: &RepoInfo) -> io::Result<Option<Value>> {
+    match fs::read(config_path(repo)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn save_config(repo: &RepoInfo, value: &Value) -> io::Result<()> {
+    let path = config_path(repo);
+    fs::create_dir_all(path.parent().unwrap())?;
+    doclify_capture::queue::atomic_write(&path, &serde_json::to_vec_pretty(value)?)
+}
+fn model_list(repo: &RepoInfo) -> Result<Value, Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let claude_bridge = Bridge::claude("claude");
+    let codex_bridge = Bridge::codex("codex");
+    let (claude, codex) = runtime
+        .block_on(async { tokio::join!(claude_bridge.capability(), codex_bridge.capability()) });
+    fn availability(capability: Capability) -> Value {
+        match capability {
+            Capability::ConstrainedAuthenticationUnverified => {
+                json!({"capability":"available", "authentication":"unverified"})
+            }
+            Capability::Unavailable(reason) => json!({"capability":"unavailable", "reason":reason}),
+        }
+    }
+    Ok(
+        json!({"selected":load_config(repo)?,"bridges":{"claude":availability(claude),"codex":availability(codex)}}),
+    )
+}
+fn handoff(repo: &RepoInfo, topic: Option<String>) -> Result<Value, Box<dyn std::error::Error>> {
+    let scope = doclify_context::Scope {
+        branch: repo.branch.clone(),
+        topic,
+    };
+    Ok(serde_json::to_value(doclify_context::build(
+        &repo.worktree,
+        &scope,
+        &Default::default(),
+    )?)?)
+}
+fn docs(background: bool) -> ExitCode {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let repo =
+            RepoInfo::discover(&std::env::current_dir()?).ok_or("not inside a Git repository")?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> io::Result<()> {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    let viewer = doclify_viewer::Viewer::new(repo.worktree)?;
+                    let (url, task) = viewer.serve().await?;
+                    let _ = tx.send(url);
+                    task.await.map_err(io::Error::other)?
+                })
+            })();
+            if let Err(e) = result {
+                eprintln!("doclify viewer: {e}");
+            }
+        });
+        let url = rx.recv().map_err(|_| "viewer failed to start")?;
+        println!("{}", json!({"url":url}));
+        io::stdout().flush()?;
+        #[cfg(target_os = "macos")]
+        let opener = "open";
+        #[cfg(not(target_os = "macos"))]
+        let opener = "xdg-open";
+        let _ = std::process::Command::new(opener).arg(&url).spawn();
+        if !background {
+            let _ = worker.join();
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("doclify: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

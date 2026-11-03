@@ -8,6 +8,11 @@ doclify-domain = { path = "../doclify-domain" }
 doclify-capture = { path = "../doclify-capture" }
 doclify-model-bridge = { path = "../../model-bridge" }
 serde_json = "1"
+doclify-evidence = { path = "../doclify-evidence" }
+doclify-context = { path = "../doclify-context" }
+doclify-pipeline = { path = "../doclify-pipeline" }
+doclify-viewer = { path = "../../viewer" }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 
 [dev-dependencies]
 tempfile = "3"
