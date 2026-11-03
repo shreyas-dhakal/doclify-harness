@@ -55,7 +55,12 @@ impl Bridge {
     }
     pub async fn capability(&self) -> Capability {
         if matches!(self.kind, Kind::Codex) {
-            return Capability::Unavailable("Codex read-only sandbox does not disable model tool execution; no verified tool-free mode".into());
+            // Fail closed without spawning Codex. codex-cli 0.166.0 `exec --help` has no
+            // tool-disabling option; `--sandbox` only governs shell commands. Even with
+            // shell_tool, unified_exec, code_mode_host and sleep_tool disabled,
+            // `codex debug prompt-input` still lists exec (nested apply_patch, view_image,
+            // MCP resources) and collaboration.spawn_agent as model-visible tools.
+            return Capability::Unavailable("Codex exec has no verifiable tool-free mode: --sandbox restricts only shell commands and feature disables leave exec/apply_patch/spawn_agent model-visible".into());
         }
         let output = match timeout(
             Duration::from_secs(5),

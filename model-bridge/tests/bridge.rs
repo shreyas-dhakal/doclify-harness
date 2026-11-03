@@ -44,6 +44,20 @@ async fn refuses_missing_capabilities_and_codex() {
     ));
 }
 #[tokio::test]
+async fn codex_fails_closed_without_spawning() {
+    let (dir, path) = fake(&format!("touch \"$(dirname \"$0\")/ran\"; echo '{HELP}'"));
+    let bridge = Bridge::codex(path);
+    assert!(matches!(
+        bridge.capability().await,
+        Capability::Unavailable(_)
+    ));
+    assert!(matches!(
+        bridge.execute(request()).await,
+        Err(BridgeError::Unsupported(_))
+    ));
+    assert!(!dir.path().join("ran").exists());
+}
+#[tokio::test]
 async fn preserves_process_failure_and_rejects_invalid_output() {
     let (_d, path) = fake(&format!(
         "if [ \"$1\" = --help ]; then echo '{HELP}'; else echo quota-exceeded >&2; exit 7; fi"
