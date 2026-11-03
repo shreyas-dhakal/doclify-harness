@@ -72,6 +72,52 @@ impl Extractor for ApiExtractor {
     }
 }
 
+/// Synchronous constrained CLI adapter; run on a blocking worker.
+pub struct CliExtractor {
+    pub bridge: doclify_model_bridge::Bridge,
+    pub model: Option<String>,
+    pub timeout: std::time::Duration,
+}
+impl Extractor for CliExtractor {
+    fn extract(&mut self, event: &Value) -> io::Result<Value> {
+        use doclify_model_bridge::{providers, BridgeError, Request};
+        let request = Request {
+            prompt: format!("{}\n\n{}", providers::INSTRUCTION, event),
+            schema: providers::proposal_schema(),
+            model: self.model.clone(),
+            timeout: self.timeout,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let value =
+            runtime
+                .block_on(self.bridge.execute(request))
+                .map_err(|error| match error {
+                    BridgeError::Unsupported(reason) => {
+                        io::Error::other(format!("CLI unavailable: {reason}"))
+                    }
+                    _ => io::Error::other("CLI extraction failed; captured work remains pending"),
+                })?;
+        providers::validate_proposals(&value.to_string()).map_err(io::Error::other)?;
+        Ok(value)
+    }
+}
+
+/// Explicit provider selection; failures never trigger an implicit fallback.
+pub enum SelectedExtractor {
+    Api(ApiExtractor),
+    Cli(CliExtractor),
+}
+impl Extractor for SelectedExtractor {
+    fn extract(&mut self, event: &Value) -> io::Result<Value> {
+        match self {
+            Self::Api(extractor) => extractor.extract(event),
+            Self::Cli(extractor) => extractor.extract(event),
+        }
+    }
+}
+
 /// Extract, validate source references, and import immutable proposed records before acknowledgement.
 /// Serialize this operation for each repository, including across processes.
 pub fn process_proposals(
