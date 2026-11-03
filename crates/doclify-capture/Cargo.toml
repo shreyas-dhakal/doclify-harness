@@ -1,0 +1,8 @@
+[package]
+name = "doclify-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Codex and Claude Code hook capture, hook installation, and transcript adapters for Doclify"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
