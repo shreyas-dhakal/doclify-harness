@@ -11,10 +11,10 @@ fn reconciliation_replays_partial_and_changed_transcripts_without_duplicates() {
     fs::write(&transcript, "{\"type\":\"user\",\"uuid\":\"1\",\"message\":{\"content\":\"hello\"}}\n{\"type\":\"assistant\"").unwrap();
     queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
     queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
-    assert_eq!(queue.pending().unwrap().len(), 2);
+    assert_eq!(queue.pending().unwrap().len(), 1);
     fs::write(&transcript, "{\"type\":\"user\",\"uuid\":\"1\",\"message\":{\"content\":\"hello\"}}\n{\"type\":\"assistant\",\"uuid\":\"2\",\"message\":{\"content\":\"reply\"}}\n").unwrap();
     queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
-    assert_eq!(queue.pending().unwrap().len(), 3);
+    assert_eq!(queue.pending().unwrap().len(), 2);
 }
 #[test]
 fn unsupported_transcript_stays_pending_until_corrected() {
@@ -30,7 +30,7 @@ fn unsupported_transcript_stays_pending_until_corrected() {
     )
     .unwrap();
     queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
-    assert_eq!(queue.pending().unwrap().len(), 2);
+    assert_eq!(queue.pending().unwrap().len(), 1);
 }
 
 #[test]

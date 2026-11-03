@@ -13,7 +13,10 @@ fn validates_answers_and_proposed_edits() {
                 kind: "requirement".into(),
                 summary: "Allow guests".into(),
                 review: "proposed".into(),
-                evidence: vec!["event:1".into()]
+                evidence: vec!["event:1".into()],
+                rationale: None,
+                excerpt: None,
+                implementation: None
             }]
         }
         .proposals

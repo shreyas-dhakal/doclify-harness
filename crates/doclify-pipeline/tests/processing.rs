@@ -344,3 +344,32 @@ fn malformed_hook_does_not_block_later_valid_hook() {
     );
     assert!(hooks.join("rejected/01.json").exists());
 }
+
+#[test]
+fn imported_proposal_preserves_supported_details() {
+    struct Detailed;
+    impl Extractor for Detailed {
+        fn extract(&mut self, event: &Value) -> io::Result<Value> {
+            Ok(
+                serde_json::json!({"proposals":[{"kind":"decision","summary":"Allow guests","review":"proposed","evidence":[event["source_id"]],"rationale":"Avoid abandonment","excerpt":"Customers abandon account creation","implementation":"partial"}]}),
+            )
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    queue.reconcile(&serde_json::json!({"agent":"codex","payload":{"prompt":"Customers abandon account creation"}})).unwrap();
+    let id = queue.pending().unwrap()[0].0.clone();
+    let store = doclify_domain::Store::open(dir.path()).unwrap();
+    doclify_pipeline::process_proposals(&queue, &dir.path().join("out"), &store, &mut Detailed)
+        .unwrap();
+    let record = &store.history(&format!("capture-{id}-0")).unwrap()[0];
+    assert_eq!(record.rationale, "Avoid abandonment");
+    assert_eq!(
+        record.provenance[0].excerpt.as_deref(),
+        Some("Customers abandon account creation")
+    );
+    assert_eq!(
+        record.implementation,
+        doclify_domain::ImplementationState::Partial
+    );
+}

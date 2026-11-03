@@ -59,7 +59,9 @@ impl Queue {
         let raw = serde_json::to_vec(event)?;
         let event_id = digest(&raw);
         let payload = &event["payload"];
-        if !payload.is_object() || (payload.get("transcript_path").is_some() && !payload["transcript_path"].is_string()) {
+        if !payload.is_object()
+            || (payload.get("transcript_path").is_some() && !payload["transcript_path"].is_string())
+        {
             return Err(invalid("invalid hook payload"));
         }
         let Some(path) = payload["transcript_path"].as_str() else {
@@ -116,7 +118,8 @@ impl Queue {
             )));
         }
         atomic_write(&self.root.join("events").join(&event_id), &raw)?;
-        self.enqueue(&event_id, &json!({"source":"hook", "event":event}))?;
+        // The transcript is the authoritative source for transcript-backed hooks.
+        // Keep the raw hook for audit without extracting the same prompt twice.
         for entry in read.entries {
             let identity = entry.id.clone().unwrap_or_else(|| {
                 format!(

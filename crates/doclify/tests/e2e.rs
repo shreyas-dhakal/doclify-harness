@@ -209,7 +209,7 @@ impl Provider {
                         .unwrap_or("");
                     let source = input["source_id"].clone();
                     let content = json!({"proposals": markers(own).into_iter().map(|(kind, summary)| {
-                        json!({"kind":kind,"summary":summary,"review":"proposed","evidence":[source]})
+                        json!({"kind":kind,"summary":summary,"review":"proposed","evidence":[source], "rationale": if own.contains("because") { Some(own.split(" [[").next().unwrap_or(own)) } else { None }})
                     }).collect::<Vec<_>>()});
                     (
                         "200 OK",

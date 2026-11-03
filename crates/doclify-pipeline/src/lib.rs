@@ -192,13 +192,24 @@ pub fn process_proposals_locked(
                 },
                 title: p.summary.clone(),
                 statement: p.summary,
-                rationale: String::new(),
+                rationale: p.rationale.unwrap_or_default(),
                 review: ReviewState::Proposed,
-                implementation: ImplementationState::Unknown,
+                implementation: match p.implementation.as_deref() {
+                    Some("planned") => ImplementationState::Planned,
+                    Some("partial") => ImplementationState::Partial,
+                    Some("implemented") => ImplementationState::Implemented,
+                    Some("reverted") => ImplementationState::Reverted,
+                    _ => ImplementationState::Unknown,
+                },
                 experiment_outcome: None,
                 provenance: vec![Provenance {
                     source: source.clone(),
-                    excerpt: None,
+                    excerpt: p.excerpt.or_else(|| {
+                        event["text"]
+                            .as_str()
+                            .or(event["event"]["payload"]["prompt"].as_str())
+                            .map(str::to_owned)
+                    }),
                 }],
                 evidence: p.evidence,
                 supersedes: None,

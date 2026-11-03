@@ -15,6 +15,12 @@ pub struct Proposal {
     pub summary: String,
     pub review: String,
     pub evidence: Vec<String>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
+    #[serde(default)]
+    pub implementation: Option<String>,
 }
 
 /// Rejects unsupported states and uncited claims; acceptance always belongs to human review.
@@ -25,6 +31,9 @@ pub fn validate_proposals(input: &str) -> Result<ProposalBatch, String> {
         if !["requirement", "decision", "experiment", "question", "task"].contains(&p.kind.as_str())
             || p.review != "proposed"
             || p.summary.trim().is_empty()
+            || p.implementation.as_deref().is_some_and(|s| {
+                !["unknown", "planned", "partial", "implemented", "reverted"].contains(&s)
+            })
             || p.evidence.is_empty()
             || p.evidence.iter().any(|e| e.trim().is_empty())
         {
@@ -35,9 +44,9 @@ pub fn validate_proposals(input: &str) -> Result<ProposalBatch, String> {
 }
 
 pub fn proposal_schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["proposals"],"properties":{"proposals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["kind","summary","review","evidence"],"properties":{"kind":{"type":"string","enum":["requirement","decision","experiment","question","task"]},"summary":{"type":"string"},"review":{"type":"string","enum":["proposed"]},"evidence":{"type":"array","items":{"type":"string"}}}}}}})
+    json!({"type":"object","additionalProperties":false,"required":["proposals"],"properties":{"proposals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["kind","summary","review","evidence","rationale","excerpt","implementation"],"properties":{"kind":{"type":"string","enum":["requirement","decision","experiment","question","task"]},"summary":{"type":"string"},"review":{"type":"string","enum":["proposed"]},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":["string","null"]},"excerpt":{"type":["string","null"]},"implementation":{"type":["string","null"],"enum":["unknown","planned","partial","implemented","reverted",null]}}}}}})
 }
-pub const INSTRUCTION: &str = "Extract documentation proposals from the supplied material. Return only JSON matching the schema. Cite supplied evidence identifiers; never accept a decision.";
+pub const INSTRUCTION: &str = "Extract documentation proposals from the supplied material. Return only JSON matching the schema. Cite supplied evidence identifiers; never accept a decision. Preserve supported rationale, source excerpts, and implementation status; use null when unknown.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {
