@@ -1,8 +1,9 @@
 //! Hook entry point. Runs inside the agent's hook process, so it must be fast,
-//! never call a model, never print to stdout, and never fail the agent.
+//! never call a model, and never fail the agent. Stdout carries only
+//! SessionStart context.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,7 +25,32 @@ pub fn run(agent: Agent) -> io::Result<Option<PathBuf>> {
     let mut raw = Vec::new();
     io::stdin().take(MAX_PAYLOAD).read_to_end(&mut raw)?;
     io::copy(&mut io::stdin(), &mut io::sink())?;
-    enqueue(agent, &raw, &std::env::current_dir()?)
+    let cwd = std::env::current_dir()?;
+    let queued = enqueue(agent, &raw, &cwd);
+    if let Some(out) = session_context(&raw, &cwd) {
+        let _ = io::stdout().write_all(out.as_bytes());
+    }
+    queued
+}
+
+/// SessionStart (startup, resume, clear, compact) gets bounded context from
+/// reviewed local records in the `hookSpecificOutput` form both agents accept.
+/// Delivery needs `.doclify/records`, not capture registration; any failure
+/// yields `None` so the agent starts without context.
+pub fn session_context(raw: &[u8], fallback_cwd: &Path) -> Option<String> {
+    let payload: Value = serde_json::from_slice(raw).ok()?;
+    if payload["hook_event_name"] != "SessionStart" {
+        return None;
+    }
+    let cwd = payload["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| fallback_cwd.to_path_buf());
+    // ponytail: second `git rev-parse` after enqueue's; share RepoInfo if hook latency matters.
+    let repo = RepoInfo::discover(&cwd)?;
+    let scope = doclify_context::Scope { branch: repo.branch, topic: None };
+    let context = doclify_context::build(&repo.worktree, &scope, &Default::default()).ok()??;
+    let out = json!({
+        "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context.render() }
+    });
+    Some(out.to_string())
 }
 
 /// Writes one event file into the repository's queue. Returns `None` when the
