@@ -245,11 +245,12 @@ fn selected_cli_extracts_proposals_and_unavailable_codex_keeps_work() {
     let cli = dir.path().join("claude");
     std::fs::write(&cli, r##"#!/bin/sh
 if [ "$1" = "--help" ]; then
- echo '--print --output-format --json-schema --tools --restricted --safe-mode --strict-mcp-config --no-session-persistence --disable-slash-commands --permission-mode --permission-prompts'
+ echo '--print --output-format --json-schema --verbose --tools --restricted --safe-mode --strict-mcp-config --no-session-persistence --disable-slash-commands --permission-mode --permission-prompts'
 else
  [ "$DOCLIFY_BRIDGE" = 1 ] || exit 9
  cat >/dev/null
- echo '{"structured_output":{"proposals":[]}}'
+ echo '{"type":"system","subtype":"init","tools":["StructuredOutput"],"mcp_servers":[]}'
+ echo '{"type":"result","structured_output":{"proposals":[]}}'
 fi
 "##).unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();

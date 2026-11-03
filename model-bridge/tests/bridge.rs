@@ -1,4 +1,4 @@
-use doclify_model_bridge::{Bridge, BridgeError, Capability, Request};
+use doclify_model_bridge::{codex_visible_tools, Bridge, BridgeError, Capability, Request};
 use serde_json::json;
 use std::{os::unix::fs::PermissionsExt, time::Duration};
 
@@ -17,10 +17,12 @@ fn request() -> Request {
         timeout: Duration::from_secs(2),
     }
 }
-const HELP: &str = "--print --output-format --json-schema --tools --restricted --safe-mode --strict-mcp-config --no-session-persistence --disable-slash-commands --permission-mode --permission-prompts";
+const INIT: &str =
+    r#"{"type":"system","subtype":"init","tools":["StructuredOutput"],"mcp_servers":[]}"#;
+const HELP: &str = "--print --output-format --json-schema --verbose --tools --restricted --safe-mode --strict-mcp-config --no-session-persistence --disable-slash-commands --permission-mode --permission-prompts";
 #[tokio::test]
 async fn returns_only_schema_validated_result() {
-    let (_d, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else cat >/dev/null; echo '{{\"is_error\":false,\"structured_output\":{{\"answer\":\"ok\"}}}}'; fi"));
+    let (_d, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else cat >/dev/null; echo '{INIT}'; echo '{{\"type\":\"result\",\"is_error\":false,\"structured_output\":{{\"answer\":\"ok\"}}}}'; fi"));
     let bridge = Bridge::claude(path);
     assert_eq!(
         bridge.capability().await,
@@ -69,7 +71,7 @@ async fn preserves_process_failure_and_rejects_invalid_output() {
         }
         other => panic!("{other:?}"),
     }
-    let (_d, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else echo '{{\"structured_output\":{{\"answer\":42}}}}'; fi"));
+    let (_d, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else echo '{INIT}'; echo '{{\"type\":\"result\",\"structured_output\":{{\"answer\":42}}}}'; fi"));
     assert!(matches!(
         Bridge::claude(path).execute(request()).await,
         Err(BridgeError::InvalidOutput(_))
@@ -77,7 +79,7 @@ async fn preserves_process_failure_and_rejects_invalid_output() {
 }
 #[tokio::test]
 async fn rejects_provider_error_envelopes_and_times_out() {
-    let (_d, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else echo '{{\"is_error\":true,\"result\":\"authentication failed\"}}'; fi"));
+    let (_d, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else echo '{INIT}'; echo '{{\"type\":\"result\",\"is_error\":true,\"result\":\"authentication failed\"}}'; fi"));
     assert!(matches!(
         Bridge::claude(path).execute(request()).await,
         Err(BridgeError::Provider(_))
@@ -91,4 +93,80 @@ async fn rejects_provider_error_envelopes_and_times_out() {
         Bridge::claude(path).execute(req).await,
         Err(BridgeError::Timeout)
     ));
+}
+#[tokio::test]
+async fn kills_runs_whose_init_exposes_more_than_structured_output() {
+    let init = INIT.replace("[\"StructuredOutput\"]", "[\"StructuredOutput\",\"Bash\"]");
+    let (dir, path) = fake(&format!("if [ \"$1\" = --help ]; then echo '{HELP}'; else echo '{init}'; sleep 1; touch \"$(dirname \"$0\")/continued\"; fi"));
+    match Bridge::claude(path).execute(request()).await {
+        Err(BridgeError::Unsupported(reason)) => assert!(reason.contains("Bash"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!dir.path().join("continued").exists());
+    let mcp = INIT.replace("\"mcp_servers\":[]", "\"mcp_servers\":[{\"name\":\"x\"}]");
+    let (_d, path) = fake(&format!(
+        "if [ \"$1\" = --help ]; then echo '{HELP}'; else echo '{mcp}'; fi"
+    ));
+    assert!(matches!(
+        Bridge::claude(path).execute(request()).await,
+        Err(BridgeError::Unsupported(_))
+    ));
+}
+#[tokio::test]
+async fn requires_init_before_result() {
+    for script in [
+        "echo '{\"type\":\"result\",\"structured_output\":{\"answer\":\"ok\"}}'",
+        "cat >/dev/null",
+    ] {
+        let (_d, path) = fake(&format!(
+            "if [ \"$1\" = --help ]; then echo '{HELP}'; else {script}; fi"
+        ));
+        assert!(matches!(
+            Bridge::claude(path).execute(request()).await,
+            Err(BridgeError::Unsupported(_))
+        ));
+    }
+}
+#[tokio::test]
+async fn codex_diagnostic_lists_rendered_tools_from_empty_home() {
+    let (_d, path) = fake(
+        r#"[ "$1 $2" = "debug prompt-input" ] && [ "$3" = --disable ] && [ "$(pwd -P)" = "$(cd "$CODEX_HOME" && pwd -P)" ] && [ -z "$(ls -A "$CODEX_HOME")" ] || exit 3
+echo '[{"type":"additional_tools","tools":[{"type":"namespace","name":"functions","tools":[{"name":"exec"}]},{"name":"spawn_agent"}]},{"type":"message"}]'"#,
+    );
+    assert_eq!(
+        codex_visible_tools(&path, &["--disable", "shell_tool"])
+            .await
+            .unwrap(),
+        ["functions.exec", "spawn_agent"]
+    );
+    let (_d, path) = fake(r#"echo '[{"type":"message"}]'"#);
+    assert!(matches!(
+        codex_visible_tools(&path, &[]).await,
+        Err(BridgeError::InvalidOutput(_))
+    ));
+}
+/// Opt-in: `DOCLIFY_LIVE_CLAUDE=1` runs one authenticated inference with the installed `claude`,
+/// using its own login in place; `execute` itself verifies the runtime tool list.
+#[tokio::test]
+async fn live_claude_runtime_constraint() {
+    if std::env::var_os("DOCLIFY_LIVE_CLAUDE").is_none() {
+        return;
+    }
+    let mut req = request();
+    req.prompt = "Reply with answer \"ok\".".into();
+    req.model = Some("haiku".into());
+    req.timeout = Duration::from_secs(120);
+    let value = Bridge::claude("claude").execute(req).await.unwrap();
+    assert!(value["answer"].is_string());
+}
+/// Opt-in: `DOCLIFY_LIVE_CODEX=1` renders the installed Codex's tools without credentials; fails
+/// once a release offers a tool-free mode, signalling the Codex bridge can be revisited.
+#[tokio::test]
+async fn live_codex_still_exposes_tools() {
+    if std::env::var_os("DOCLIFY_LIVE_CODEX").is_none() {
+        return;
+    }
+    let tools = codex_visible_tools("codex", &[]).await.unwrap();
+    assert!(tools.iter().any(|t| t.ends_with("exec")), "{tools:?}");
 }
