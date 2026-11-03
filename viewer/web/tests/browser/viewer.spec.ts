@@ -92,3 +92,14 @@ test('keyboard: skip link, document navigation and Ctrl+S save', async ({ page }
   await expect(page.getByRole('status')).toHaveText('Saved. Review status was not changed.')
   expect(readFileSync(disk('keyboard.md'), 'utf8')).toBe('# keyboard\n\nSaved by shortcut.\n')
 })
+
+test('search finds documents and records through the local index', async ({ page }) => {
+  await page.goto(process.env.VIEWER_URL!)
+  const search = page.getByRole('searchbox', { name: 'Search documentation and records' })
+  await search.fill('saved carts')
+  await expect(page.locator('summary', { hasText: 'Saved carts' })).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Documentation' }).getByRole('button')).toHaveCount(0)
+  await search.fill('odd   spacing')
+  await expect(page.getByRole('button', { name: 'guide', exact: true })).toBeVisible()
+  await expect(page.locator('summary', { hasText: 'Saved carts' })).toHaveCount(0)
+})

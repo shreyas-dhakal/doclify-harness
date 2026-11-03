@@ -77,6 +77,7 @@ impl Viewer {
             .route("/api/documents", get(list))
             .route("/api/document", get(read).put(save))
             .route("/api/records", get(records))
+            .route("/api/search", get(search))
             .route("/api/review", axum::routing::post(review))
             .fallback(get(asset))
             .layer(middleware::from_fn_with_state(state.clone(), check_host))
@@ -256,6 +257,20 @@ async fn save(
     tokio::task::spawn_blocking(move || viewer.write(data))
         .await
         .map_err(internal)?
+}
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+async fn search(
+    State(app): State<App>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Vec<doclify_search::Hit>>, StatusCode> {
+    tokio::task::spawn_blocking(move || doclify_search::search(&app.viewer.root, &query.q))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 async fn records(State(app): State<App>) -> Result<Json<Vec<doclify_domain::Record>>, StatusCode> {
     let base = app.viewer.root.join(".doclify/records");

@@ -6,6 +6,7 @@ import '@mdxeditor/editor/style.css'
 import './style.css'
 import { join, split, type Segment } from './mdx'
 
+type SearchHit = { kind: 'document' | 'record'; path: string; title: string }
 type Doc = { path: string; content: string; revision: string }
 type Provenance = { source: string; excerpt: string | null }
 type DocRecord = { id: string; version: number; kind: string; title: string; statement: string; rationale: string; review: string; implementation: string; experiment_outcome: string | null; provenance: Provenance[]; evidence: string[]; supersedes: number | null }
@@ -46,6 +47,13 @@ function App() {
   const [files, setFiles] = useState<string[]>([]), [docs, setDocs] = useState<Doc[]>([]), [selected, setSelected] = useState<Doc | null>(null)
   const [text, setText] = useState(''), [mode, setMode] = useState<'read' | 'rich' | 'source'>('read'), [segments, setSegments] = useState<Segment[]>([])
   const [query, setQuery] = useState(''), [records, setRecords] = useState<DocRecord[]>([]), [message, setMessage] = useState(''), [busy, setBusy] = useState(false), [conflict, setConflict] = useState<Doc | null>(null)
+  const [hits, setHits] = useState<SearchHit[]>([])
+  useEffect(() => {
+    if (!query.trim()) { setHits([]); return }
+    const controller = new AbortController()
+    const timer = setTimeout(() => { fetch('/api/search?q=' + encodeURIComponent(query), { signal: controller.signal }).then(r => { if (!r.ok) throw new Error(); return r.json() }).then(setHits).catch(e => { if (e.name !== 'AbortError') setMessage('Search failed. Check that the viewer is still running.') }) }, 150)
+    return () => { clearTimeout(timer); controller.abort() }
+  }, [query, docs, records])
   const heading = useRef<HTMLHeadingElement>(null), conflictHeading = useRef<HTMLHeadingElement>(null)
   const dirty = !!selected && text !== selected.content
   const loadRecords = () => fetch('/api/records').then(r => r.json()).then(setRecords)
@@ -76,11 +84,12 @@ function App() {
     if (r?.status === 403) { setMessage(SESSION); return }
     await loadRecords().catch(() => {}); setMessage('Review was not recorded because the proposal changed or the viewer stopped. The queue now shows the latest versions.')
   }
-  const filtered = docs.filter(d => (d.path + '\n' + d.content).toLowerCase().includes(query.toLowerCase()))
+  const filtered = query.trim() ? docs.filter(d => hits.some(h => h.kind === 'document' && h.path === d.path)) : docs
+  const matchingRecords = query.trim() ? records.filter(r => hits.some(h => h.kind === 'record' && h.path === r.id)) : records
   const proposed = records.filter(r => r.review === 'proposed')
   const status = message && <div role="status" className="notice">{message}</div>
   return <><a className="skip" href="#main">Skip to document</a><header><div className="brand"><span className="mark" aria-hidden="true">D</span><span>Doclify <small> / Documentation</small></span></div><span className="local"><span className="dot" aria-hidden="true" /> Local workspace</span></header>
-    <div className="layout"><aside className="nav" aria-label="Library"><h2>Library</h2><label className="search"><span>Search documentation</span><input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search titles and text" /></label>
+    <div className="layout"><aside className="nav" aria-label="Library"><h2>Library</h2><label className="search"><span>Search documentation and records</span><input type="search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search titles and text" /></label>
       <div className="section-title">DOCUMENTS <span>{filtered.length}</span></div>
       <nav aria-label="Documentation">{filtered.map(d => <button key={d.path} className={'nav-item ' + (selected?.path === d.path ? 'active' : '')} onClick={() => open(d)} aria-current={selected?.path === d.path ? 'page' : undefined}><span className="file-icon" aria-hidden="true">▤</span>{label(d.path)}</button>)}</nav>
       {!files.length && <p className="muted">No documents yet. Generate documentation in <code>docs/doclify/</code> to see it here.</p>}{files.length > 0 && !filtered.length && <p className="muted">No matching documents.</p>}</aside>
@@ -103,10 +112,10 @@ function App() {
             <div className="review-actions">{(['accept', 'reject', 'supersede'] as const).map(a => <button key={a} disabled={!token} onClick={() => review(r, a)} aria-label={`${a[0].toUpperCase() + a.slice(1)} ${r.title}`}>{a[0].toUpperCase() + a.slice(1)}</button>)}</div></div>) : <p className="muted">No proposed records found.</p>}
           <p className="muted small">Accept, reject, or supersede each proposal explicitly. Saving a document does not accept a decision.</p></section>
         <section className="context-section" aria-labelledby="records-title"><h3 id="records-title" className="section-title">EVIDENCE &amp; RECORDS <span>{records.length}</span></h3>
-          {records.length ? records.map(r => <details key={r.id}><summary>{r.title} <span className="muted">· {words(r.kind)} · {words(r.review)}</span></summary>
+          {matchingRecords.length ? matchingRecords.map(r => <details key={r.id}><summary>{r.title} <span className="muted">· {words(r.kind)} · {words(r.review)}</span></summary>
             {notInstruction(r) && <p className="badge">{notInstruction(r)}, not an instruction</p>}<p>{r.statement}</p><p className="muted">{r.rationale}</p>
             <dl><dt>Review</dt><dd>{words(r.review)} (version {r.version})</dd><dt>Implementation</dt><dd>{words(r.implementation)}</dd>{r.experiment_outcome && <><dt>Experiment</dt><dd>{words(r.experiment_outcome)}</dd></>}</dl>
             {r.evidence.length > 0 && <><h4>Evidence</h4><ul>{r.evidence.map((e, i) => <li key={i}><code>{e}</code></li>)}</ul></>}
-            {r.provenance.length > 0 && <><h4>Provenance</h4><ul>{r.provenance.map((p, i) => <li key={i}><code>{p.source}</code>{p.excerpt && <blockquote>{p.excerpt}</blockquote>}</li>)}</ul></>}</details>) : <p className="muted">Evidence will appear when records are available.</p>}</section></aside></div></>
+            {r.provenance.length > 0 && <><h4>Provenance</h4><ul>{r.provenance.map((p, i) => <li key={i}><code>{p.source}</code>{p.excerpt && <blockquote>{p.excerpt}</blockquote>}</li>)}</ul></>}</details>) : <p className="muted">{query.trim() ? "No matching records." : "Evidence will appear when records are available."}</p>}</section></aside></div></>
 }
 createRoot(document.getElementById('root')!).render(<App />)
