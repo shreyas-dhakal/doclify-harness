@@ -6,16 +6,17 @@ edition = "2021"
 [dependencies]
 doclify-domain = { path = "../crates/doclify-domain" }
 axum = "0.8"
-tokio = { version = "1", features = ["net", "sync"] }
+tokio = { version = "1", features = ["net", "rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 rand = "0.8"
 rust-embed = "8"
 mime_guess = "2"
-tempfile = "3"
+cap-std = "3"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

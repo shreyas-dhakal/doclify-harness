@@ -1,3 +1,5 @@
 /target/
 /web/node_modules/
 /web/*.tsbuildinfo
+/web/test-results/
+/web/playwright-report/
