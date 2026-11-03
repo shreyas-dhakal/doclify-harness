@@ -523,3 +523,41 @@ fn extracted_experiment_outcome_is_preserved() {
         Some(doclify_domain::ExperimentOutcome::Abandoned)
     );
 }
+
+/// Claude Code 2.1.308 opens transcripts with cwd-less `queue-operation` lines;
+/// ownership comes from the first line that carries a cwd.
+#[test]
+fn claude_transcript_with_leading_queue_operations_is_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let sessions = dir.path().join("sessions");
+    let hooks = dir.path().join("hooks");
+    for path in [&repo, &sessions, &hooks] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let transcript = sessions.join("s.jsonl");
+    let lines = [
+        serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"s"}),
+        serde_json::json!({"type":"user","uuid":"u1","sessionId":"s","cwd":repo,"message":{"role":"user","content":"login work"}}),
+    ];
+    std::fs::write(&transcript, lines.map(|l| format!("{l}\n")).concat()).unwrap();
+    std::fs::write(hooks.join("event.json"), serde_json::json!({"agent":"claude","payload":{"session_id":"s","transcript_path":transcript}}).to_string()).unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    let store = doclify_domain::Store::open(&repo).unwrap();
+    doclify_pipeline::run_once(
+        &queue,
+        &hooks,
+        &repo,
+        &[("claude", &sessions)],
+        &dir.path().join("out"),
+        &store,
+        &mut Provider { fail: true },
+    )
+    .ok();
+    assert!(!hooks.join("rejected/event.json").exists());
+    assert_eq!(queue.pending().unwrap().len(), 1);
+    assert_eq!(
+        doclify_pipeline::discover_sessions(&queue, &repo, "claude", &sessions).unwrap(),
+        1
+    );
+}

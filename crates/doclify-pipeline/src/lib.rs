@@ -359,7 +359,9 @@ fn capture_scope(event: &Value) -> Option<doclify_domain::RecordScope> {
         &event["event"]
     };
     // A session's branch is provenance, not proof that a claim is branch-scoped.
-    let branch = origin["payload"]["scope"]["branch"].as_str().map(str::to_owned);
+    let branch = origin["payload"]["scope"]["branch"]
+        .as_str()
+        .map(str::to_owned);
     let paths: Vec<String> = origin["payload"]["paths"]
         .as_array()
         .map(|items| {
@@ -406,8 +408,22 @@ fn capture_session(event: &Value) -> Option<doclify_domain::SessionAttribution> 
     }
 }
 
-/// Scan session trees without following symlinks. Only sessions whose first
-/// metadata record identifies a working directory inside `repository` are used.
+fn transcript_metadata(agent: &str, bytes: &[u8]) -> Option<Value> {
+    let mut lines = bytes.split(|b| *b == b'\n');
+    match agent {
+        "codex" => serde_json::from_slice::<Value>(lines.next()?)
+            .ok()
+            .filter(|v| v["type"] == "session_meta")
+            .map(|v| v["payload"].clone()),
+        "claude" => lines
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .find(|v| v["cwd"].is_string()),
+        _ => None,
+    }
+}
+
+/// Scan session trees without following symlinks. Only sessions whose agent
+/// metadata identifies a working directory inside `repository` are used.
 pub fn discover_sessions(
     queue: &Queue,
     repository: &Path,
@@ -439,17 +455,7 @@ pub fn discover_sessions(
             let path = entry.path();
             let relative = path.strip_prefix(root).map_err(io::Error::other)?;
             let bytes = scoped.read(relative)?;
-            let Some(end) = bytes.iter().position(|b| *b == b'\n') else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_slice::<Value>(&bytes[..end]) else {
-                continue;
-            };
-            let metadata = if agent == "codex" && value["type"] == "session_meta" {
-                &value["payload"]
-            } else if agent == "claude" {
-                &value
-            } else {
+            let Some(metadata) = transcript_metadata(agent, &bytes) else {
                 continue;
             };
             let Some(cwd) = metadata["cwd"].as_str() else {
@@ -531,23 +537,12 @@ pub fn reconcile_repository_locked(
                     })?;
                 let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
                 let bytes = dir.read(relative)?;
-                let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
-                let value: Value = serde_json::from_slice(first).map_err(|_| {
+                let metadata = transcript_metadata(agent, &bytes).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "invalid transcript metadata",
                     )
                 })?;
-                let metadata = match agent {
-                    "codex" if value["type"] == "session_meta" => &value["payload"],
-                    "claude" => &value,
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "invalid transcript agent",
-                        ))
-                    }
-                };
                 let id = metadata[if agent == "codex" { "id" } else { "sessionId" }].as_str();
                 let owns = metadata["cwd"]
                     .as_str()

@@ -66,7 +66,10 @@ impl Queue {
         }
         let Some(path) = payload["transcript_path"].as_str() else {
             atomic_write(&self.root.join("events").join(&event_id), &raw)?;
-            if matches!(payload["hook_event_name"].as_str(), Some("PostToolUse" | "PostToolUseFailure")) {
+            if matches!(
+                payload["hook_event_name"].as_str(),
+                Some("PostToolUse" | "PostToolUseFailure")
+            ) {
                 return Ok(());
             }
             return self.enqueue(&event_id, &json!({"source":"hook", "event":event}));
@@ -122,7 +125,25 @@ impl Queue {
         }
         atomic_write(&self.root.join("events").join(&event_id), &raw)?;
         // The transcript is the authoritative source for transcript-backed hooks.
-        // Keep the raw hook for audit without extracting the same prompt twice.
+        // Keep the raw hook for audit without extracting the same prompt twice:
+        // each job carries only the hook's metadata, never its prompt or reply,
+        // or every entry of the turn would show the model the same content.
+        let mut context = event.clone();
+        if let Some(p) = context["payload"].as_object_mut() {
+            p.retain(|k, _| {
+                matches!(
+                    k.as_str(),
+                    "session_id"
+                        | "parent_session_id"
+                        | "turn_id"
+                        | "hook_event_name"
+                        | "cwd"
+                        | "transcript_path"
+                        | "scope"
+                        | "paths"
+                )
+            });
+        }
         for entry in read.entries {
             let identity = entry.id.clone().unwrap_or_else(|| {
                 format!(
@@ -132,7 +153,7 @@ impl Queue {
                 )
             });
             let id = digest(format!("{agent_name}\0{session}\0{identity}").as_bytes());
-            self.enqueue(&id, &json!({"source":"transcript", "agent":agent_name, "session_id":session, "transcript_path":path, "offset":entry.offset, "kind":format!("{:?}", entry.kind), "text":entry.text, "raw":entry.raw, "context":event}))?;
+            self.enqueue(&id, &json!({"source":"transcript", "agent":agent_name, "session_id":session, "transcript_path":path, "offset":entry.offset, "kind":format!("{:?}", entry.kind), "text":entry.text, "raw":entry.raw, "context":context}))?;
         }
         let n = read.next_offset as usize;
         if n > bytes.len() {

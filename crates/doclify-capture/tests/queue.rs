@@ -135,3 +135,27 @@ fn tool_results_are_retained_without_creating_proposal_jobs() {
     assert!(queue.pending().unwrap().is_empty());
     assert_eq!(fs::read_dir(dir.path().join("events")).unwrap().count(), 1);
 }
+
+#[test]
+fn transcript_jobs_carry_hook_metadata_not_its_prompt() {
+    let root = tempfile::tempdir().unwrap();
+    let transcript = root.path().join("session.jsonl");
+    let queue = Queue::open(root.path().join("local")).unwrap();
+    fs::write(&transcript, "{\"type\":\"user\",\"uuid\":\"1\",\"message\":{\"content\":\"allow guest checkout\"}}\n{\"type\":\"assistant\",\"uuid\":\"2\",\"message\":{\"content\":\"ok\"}}\n").unwrap();
+    let event = json!({"agent":"claude","head":"main","payload":{"session_id":"s","parent_session_id":"parent","scope":{"branch":"feature"},"paths":["src"],"hook_event_name":"Stop","transcript_path":transcript,"prompt":"allow guest checkout","last_assistant_message":"ok"}});
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    let jobs = queue.pending().unwrap();
+    assert_eq!(jobs.len(), 2);
+    for (_, job) in jobs {
+        let p = &job["context"]["payload"];
+        assert_eq!(p["session_id"], "s");
+        assert_eq!(p["parent_session_id"], "parent");
+        assert_eq!(p["scope"]["branch"], "feature");
+        assert_eq!(p["paths"][0], "src");
+        assert_eq!(job["context"]["head"], "main");
+        assert!(
+            p.get("prompt").is_none() && p.get("last_assistant_message").is_none(),
+            "{job}"
+        );
+    }
+}

@@ -207,14 +207,15 @@ impl Provider {
                     let request: Value = serde_json::from_slice(&body).unwrap();
                     let input = request["messages"][1]["content"].as_str().unwrap();
                     let input: Value = serde_json::from_str(input).unwrap();
-                    // Only the job's own content: transcript text, or a hook's prompt.
+                    // Like a live model, propose from everything the job shows,
+                    // including envelope context; rationale comes from its own text.
                     let job = &input["event"];
                     let own = job["text"]
                         .as_str()
                         .or(job["event"]["payload"]["prompt"].as_str())
                         .unwrap_or("");
                     let source = input["source_id"].clone();
-                    let content = json!({"proposals": markers(own).into_iter().map(|(kind, summary)| {
+                    let content = json!({"proposals": markers(&job.to_string()).into_iter().map(|(kind, summary)| {
                         json!({"kind":kind,"summary":summary,"review":"proposed","evidence":[source], "rationale": if own.contains("because") { Some(own.split(" [[").next().unwrap_or(own)) } else { None }})
                     }).collect::<Vec<_>>()});
                     (
