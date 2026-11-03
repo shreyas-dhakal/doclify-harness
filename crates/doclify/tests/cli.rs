@@ -139,3 +139,44 @@ fn repl_accepts_model_picker_and_exit() {
     let value: serde_json::Value = serde_json::from_slice(&model.stdout).unwrap();
     assert_eq!(value["selected"]["provider"], "claude");
 }
+
+#[test]
+fn model_configuration_rejects_credentials_in_url() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    let out = run(
+        dir.path(),
+        &[
+            "model",
+            "set",
+            "openai",
+            "https://secret@example.com/v1",
+            "API_KEY",
+            "test",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(!dir.path().join(".git/doclify/model.json").exists());
+}
+
+#[test]
+fn status_before_init_reports_unregistered() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    let out = run(dir.path(), &["status"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["registered"], false);
+}
