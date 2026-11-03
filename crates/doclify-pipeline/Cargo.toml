@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+doclify-domain = { path = "../doclify-domain" }
+doclify-model-bridge = { path = "../../model-bridge" }
 doclify-capture = { path = "../doclify-capture" }
 serde_json = "1"
 
