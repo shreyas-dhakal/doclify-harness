@@ -247,8 +247,13 @@ fn linked_worktree_inherits_registration_and_reviewed_context_without_leaking() 
         r#"{{"hook_event_name":"SessionStart","cwd":"{}"}}"#,
         wt.display()
     );
+    // Local records must not hide the primary's accepted decision.
+    add_guest_checkout_records(&wt);
+    fs::remove_dir_all(wt.join(".doclify/records/decision-guest-checkout")).unwrap();
     let out = run_hook(&wt, "claude", &payload, &[]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("guest"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("requirement-guest-checkout@v2"), "{stdout}");
+    assert!(stdout.contains("decision-guest-checkout@v2"), "{stdout}");
     let events = hook::pending(&RepoInfo::discover(&wt).unwrap().queue_dir()).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].1["worktree"], wt.to_str().unwrap());

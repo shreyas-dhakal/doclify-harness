@@ -69,15 +69,18 @@ pub fn session_context(raw: &[u8], fallback_cwd: &Path) -> Option<String> {
         branch: repo.branch.clone(),
         topic: None,
     };
-    let context = doclify_context::build(&repo.worktree, &scope, &Default::default())
-        .ok()?
-        .or_else(|| {
-            if !repo.registered() {
-                return None;
-            }
-            let primary = repo.primary_worktree()?;
-            doclify_context::build(&primary, &scope, &Default::default()).ok()?
-        })?;
+    // Registered linked worktrees also see the primary's reviewed records;
+    // local copies win ties (see `doclify_context::build_merged`).
+    let primary = repo
+        .registered()
+        .then(|| repo.primary_worktree())
+        .flatten()
+        .filter(|p| *p != repo.worktree);
+    let worktrees: Vec<&Path> = [Some(repo.worktree.as_path()), primary.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let context = doclify_context::build_merged(&worktrees, &scope, &Default::default()).ok()??;
     let out = json!({
         "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context.render() }
     });

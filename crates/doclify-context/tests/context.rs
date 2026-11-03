@@ -1,4 +1,4 @@
-use doclify_context::{build, Limits, Scope};
+use doclify_context::{build, build_merged, Limits, Scope};
 use doclify_domain::*;
 use std::{fs, path::Path};
 
@@ -328,4 +328,59 @@ fn structured_constraints_match_rendered_selection() {
         .iter()
         .all(|c| ctx.render().contains(&format!("[{}@v", c.id))));
     assert!(ctx.render().contains("[decision-b@v"));
+}
+
+/// A linked worktree with its own records still sees the primary's accepted
+/// constraints; collisions resolve by latest version, then worktree order.
+#[test]
+fn merged_worktrees_keep_both_sides_and_resolve_collisions_deterministically() {
+    let (local, primary) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (l, p) = (
+        Store::open(local.path()).unwrap(),
+        Store::open(primary.path()).unwrap(),
+    );
+    let d = |id: &str, title: &str| record(id, RecordKind::Decision, title);
+    accept(&l, &d("decision-local-only", "Local only"));
+    accept(&p, &d("decision-primary-only", "Primary only"));
+    accept(&l, &d("decision-shared", "Shared, old"));
+    accept(&p, &d("decision-shared", "Shared, old"));
+    let mut newer = d("decision-shared", "Shared, newer on primary");
+    newer.version = 3;
+    p.propose(&newer).unwrap();
+    p.review("decision-shared", 3, ReviewState::Accepted)
+        .unwrap();
+    accept(&l, &d("decision-tie", "Tie, local"));
+    accept(&p, &d("decision-tie", "Tie, primary"));
+    accept(&l, &d("decision-corrupt", "Readable locally"));
+    let bad = primary.path().join(".doclify/records/decision-corrupt");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("00000000000000000001.json"), "<<<<<<< HEAD").unwrap();
+
+    let titles = |order: &[&Path]| {
+        let ctx = build_merged(order, &Scope::default(), &Limits::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.unreadable, ["decision-corrupt"]);
+        let mut t: Vec<_> = ctx
+            .constraints
+            .iter()
+            .map(|c| format!("{}@{}", c.title, c.version))
+            .collect();
+        t.sort();
+        t
+    };
+    assert_eq!(
+        titles(&[local.path(), primary.path()]),
+        [
+            "Local only@2",
+            "Primary only@2",
+            "Shared, newer on primary@4",
+            "Tie, local@2"
+        ]
+    );
+    assert_eq!(
+        titles(&[primary.path(), local.path()])[3],
+        "Tie, primary@2",
+        "ties go to the earlier worktree"
+    );
 }

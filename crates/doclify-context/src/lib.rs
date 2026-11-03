@@ -7,7 +7,7 @@ use doclify_domain::{
     ExperimentOutcome, ImplementationState, Record, RecordKind, ReviewState, Store,
 };
 use serde::Serialize;
-use std::{fs, io, path::Path};
+use std::{collections::BTreeMap, fs, io, path::Path};
 
 /// What the session is known to be about. Records carry no path scope yet, so
 /// scope only orders records by relevance; it never hides an accepted constraint.
@@ -81,28 +81,52 @@ impl Context {
 
 /// `Ok(None)` when the worktree has no records or nothing worth saying.
 pub fn build(worktree: &Path, scope: &Scope, limits: &Limits) -> io::Result<Option<Context>> {
-    let root = worktree.join(".doclify/records");
-    if !root.is_dir() {
-        return Ok(None);
+    build_merged(&[worktree], scope, limits)
+}
+
+/// Like `build`, over the union of several worktrees' records (e.g. a linked
+/// worktree, then the primary). An id held by more than one is taken from the
+/// copy with the highest latest version; ties go to the earlier worktree. If
+/// any copy is unreadable the id is reported unreadable, not resolved silently.
+pub fn build_merged(
+    worktrees: &[&Path],
+    scope: &Scope,
+    limits: &Limits,
+) -> io::Result<Option<Context>> {
+    // ponytail: scans every record on each session start; add an index if repos reach thousands of records.
+    let mut owners: BTreeMap<String, Vec<Store>> = BTreeMap::new();
+    for worktree in worktrees {
+        let root = worktree.join(".doclify/records");
+        if !root.is_dir() {
+            continue;
+        }
+        for id in fs::read_dir(&root)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|id| !id.starts_with('.'))
+        {
+            owners.entry(id).or_default().push(Store::open(worktree)?);
+        }
     }
-    let store = Store::open(worktree)?;
     let terms = terms(scope);
     let mut constraints = Vec::new();
     let mut open = Vec::new();
     let mut unreadable = Vec::new();
-    // ponytail: scans every record on each session start; add an index if repos reach thousands of records.
-    let mut ids: Vec<String> = fs::read_dir(&root)?
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|id| !id.starts_with('.'))
-        .collect();
-    ids.sort();
-    for id in ids {
-        let (history, accepted) = match store
-            .history(&id)
-            .and_then(|h| Ok((h, store.accepted(&id)?)))
-        {
+    for (id, stores) in owners {
+        let chosen = stores
+            .iter()
+            .map(|store| Ok((store, store.history(&id)?)))
+            .collect::<io::Result<Vec<_>>>()
+            .and_then(|copies| {
+                let (store, history) = copies
+                    .into_iter()
+                    .rev()
+                    .max_by_key(|(_, h)| h.last().map(|r| r.version))
+                    .expect("every id has an owner");
+                Ok((history, store.accepted(&id)?))
+            });
+        let (history, accepted) = match chosen {
             Ok(v) => v,
             Err(_) => {
                 unreadable.push(id);
