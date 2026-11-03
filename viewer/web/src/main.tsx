@@ -20,14 +20,14 @@ const SESSION = 'This viewer session is no longer authorized. Run /docs again to
 // Records that must stay discoverable without reading as settled instructions.
 const notInstruction = (r: DocRecord) => r.kind === 'question' ? 'Open question' : r.experiment_outcome === 'abandoned' ? 'Abandoned experiment' : r.review === 'rejected' ? 'Rejected' : r.review === 'superseded' ? 'Superseded' : r.review === 'proposed' ? 'Awaiting review' : ''
 
-function Markdown({ text }: { text: string }) { return <ReactMarkdown skipHtml>{text}</ReactMarkdown> }
+function Markdown({ text, onSource }: { text: string; onSource?: (id: string, version: number) => void }) { return <ReactMarkdown skipHtml components={{ a: ({ href, children }) => { const match = href?.match(/^\.\.\/\.\.\/\.doclify\/records\/([A-Za-z0-9_-]+)\/(\d+)\.json$/); return <a href={href} onClick={match && onSource ? e => { e.preventDefault(); onSource(match[1], Number(match[2])) } : undefined}>{children}</a> } }}>{text}</ReactMarkdown> }
 function Raw({ text }: { text: string }) { return <figure className="raw"><figcaption>Unsupported MDX, preserved verbatim and not executed</figcaption><pre>{text}</pre></figure> }
 function Callout({ s, children }: { s: Segment; children: React.ReactNode }) {
   return <section className={'callout callout-' + s.name!.toLowerCase()} aria-label={`${s.name}${s.attrs?.id ? ' ' + s.attrs.id : ''}`}>
     <div className="callout-head"><strong>{s.name}</strong>{s.attrs?.id && <code>{s.attrs.id}</code>}{s.attrs?.status && <span className="badge">{words(s.attrs.status)}</span>}</div>{children}</section>
 }
-function Rendered({ text }: { text: string }) {
-  return <>{split(text).map((s, i) => s.kind === 'mdx' ? <Raw key={i} text={s.body} /> : s.kind === 'component' ? <Callout key={i} s={s}><Markdown text={s.body} /></Callout> : <Markdown key={i} text={s.body} />)}</>
+function Rendered({ text, onSource }: { text: string; onSource: (id: string, version: number) => void }) {
+  return <>{split(text).map((s, i) => s.kind === 'mdx' ? <Raw key={i} text={s.body} /> : s.kind === 'component' ? <Callout key={i} s={s}><Markdown text={s.body} onSource={onSource} /></Callout> : <Markdown key={i} text={s.body} onSource={onSource} />)}</>
 }
 function Editable({ body, name, onChange }: { body: string; name: string; onChange: (md: string) => void }) {
   // The editing surface takes its accessible name from this translation key.
@@ -54,6 +54,7 @@ function App() {
     const timer = setTimeout(() => { fetch('/api/search?q=' + encodeURIComponent(query), { signal: controller.signal }).then(r => { if (!r.ok) throw new Error(); return r.json() }).then(setHits).catch(e => { if (e.name !== 'AbortError') setMessage('Search failed. Check that the viewer is still running.') }) }, 150)
     return () => { clearTimeout(timer); controller.abort() }
   }, [query, docs, records])
+  const [source, setSource] = useState<DocRecord | null>(null)
   const heading = useRef<HTMLHeadingElement>(null), conflictHeading = useRef<HTMLHeadingElement>(null)
   const dirty = !!selected && text !== selected.content
   const loadRecords = () => fetch('/api/records').then(r => r.json()).then(setRecords)
@@ -62,6 +63,13 @@ function App() {
   useEffect(() => { const handler = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); if (dirty && !busy) save() } }; window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler) })
   useEffect(() => { heading.current?.focus() }, [selected?.path])
   useEffect(() => { conflictHeading.current?.focus() }, [conflict])
+  async function openSource(id: string, version: number) {
+    try {
+      const response = await fetch(`/api/record-source?id=${encodeURIComponent(id)}&version=${version}`)
+      if (!response.ok) throw new Error()
+      setSource(await response.json())
+    } catch { setMessage('Source record could not be loaded.') }
+  }
   function switchMode(next: typeof mode) { if (next === 'rich') setSegments(split(text)); setMode(next) }
   function replace(doc: Doc) { setSelected(doc); setDocs(old => old.map(d => d.path === doc.path ? doc : d)) }
   function open(doc: Doc) { if (dirty && !confirm('Discard unsaved changes?')) return; setSelected(doc); setText(doc.content); setMode('read'); setMessage(''); setConflict(null) }
@@ -104,9 +112,9 @@ function App() {
             <button className="primary" onClick={keepMine}>Keep my edits</button> <button onClick={useLatest}>Use latest and discard mine</button> <button onClick={() => switchMode('source')}>Merge in Source</button></section>}
           {mode === 'rich' && segments.some(s => s.kind === 'mdx' || s.kind === 'locked') && <p className="notice">Some blocks are locked because rich editing would rewrite them. They are saved exactly as they are; use Source mode to change them.</p>}
           <article className="document" aria-label="Document">{mode === 'source' ? <textarea aria-label="Document source" value={text} onChange={e => setText(e.target.value)} spellCheck={false} />
-            : mode === 'rich' ? <RichEditor key={selected.path} segments={segments} onChange={s => { setSegments(s); setText(join(s)) }} /> : <Rendered text={text} />}</article></>
+            : mode === 'rich' ? <RichEditor key={selected.path} segments={segments} onChange={s => { setSegments(s); setText(join(s)) }} /> : <Rendered text={text} onSource={openSource} />}</article></>
           : <div className="empty"><div className="empty-icon" aria-hidden="true">▤</div><h1>Your workspace, in context.</h1><p>Select a document to read or edit. Decisions, evidence, and open questions stay close to the work.</p>{!files.length && <p>Documentation will appear here once it has been generated.</p>}</div>}</main>
-      <aside className="context" aria-label="Context"><h2>Context</h2><p className="muted">Review and implementation are tracked separately.</p>
+      <aside className="context" aria-label="Context"><h2>Context</h2>{source && <section className="context-section" aria-label="Source evidence"><h3>Source evidence</h3><p>{source.title} · version {source.version}</p>{source.provenance.map((p, i) => <div key={i}><code>{p.source}</code>{p.excerpt && <blockquote>{p.excerpt}</blockquote>}</div>)}<button onClick={() => setSource(null)}>Close source</button></section>}<p className="muted">Review and implementation are tracked separately.</p>
         <section className="context-section" aria-labelledby="queue-title"><h3 id="queue-title" className="section-title">REVIEW QUEUE <span>{proposed.length}</span></h3>
           {proposed.length ? proposed.map(r => <div className="record" key={r.id}><strong>{r.title}</strong><div><span className="badge">Proposed {words(r.kind)}</span> <span className="muted">Implementation: {words(r.implementation)}</span></div><p>{r.statement}</p><p className="muted">{r.rationale}</p>
             <div className="review-actions">{(['accept', 'reject', 'supersede'] as const).map(a => <button key={a} disabled={!token} onClick={() => review(r, a)} aria-label={`${a[0].toUpperCase() + a.slice(1)} ${r.title}`}>{a[0].toUpperCase() + a.slice(1)}</button>)}</div></div>) : <p className="muted">No proposed records found.</p>}
@@ -115,7 +123,8 @@ function App() {
           {matchingRecords.length ? matchingRecords.map(r => <details key={r.id}><summary>{r.title} <span className="muted">· {words(r.kind)} · {words(r.review)}</span></summary>
             {notInstruction(r) && <p className="badge">{notInstruction(r)}, not an instruction</p>}<p>{r.statement}</p><p className="muted">{r.rationale}</p>
             <dl><dt>Review</dt><dd>{words(r.review)} (version {r.version})</dd><dt>Implementation</dt><dd>{words(r.implementation)}</dd>{r.experiment_outcome && <><dt>Experiment</dt><dd>{words(r.experiment_outcome)}</dd></>}</dl>
-            {r.evidence.length > 0 && <><h4>Evidence</h4><ul>{r.evidence.map((e, i) => <li key={i}><code>{e}</code></li>)}</ul></>}
+            {r.evidence.length > 0 && <><h4>Evidence</h4><ul>{r.evidence.map((e, i) => <li key={i}>{r.provenance.some(p => p.source === e) ? <button onClick={() => openSource(r.id, r.version)} aria-label={`Open evidence ${e}`}><code>{e}</code></button> : <code>{e}</code>}</li>)}</ul></>}
             {r.provenance.length > 0 && <><h4>Provenance</h4><ul>{r.provenance.map((p, i) => <li key={i}><code>{p.source}</code>{p.excerpt && <blockquote>{p.excerpt}</blockquote>}</li>)}</ul></>}</details>) : <p className="muted">{query.trim() ? "No matching records." : "Evidence will appear when records are available."}</p>}</section></aside></div></>
+
 }
 createRoot(document.getElementById('root')!).render(<App />)

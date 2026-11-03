@@ -103,3 +103,20 @@ test('search finds documents and records through the local index', async ({ page
   await expect(page.getByRole('button', { name: 'guide', exact: true })).toBeVisible()
   await expect(page.locator('summary', { hasText: 'Saved carts' })).toHaveCount(0)
 })
+
+test('source links open the exact portable record excerpt', async ({ page }) => {
+  await openDoc(page, 'guide')
+  await page.getByRole('link', { name: 'Source excerpt' }).click()
+  const source = page.getByRole('region', { name: 'Source evidence' })
+  await expect(source).toContainText('codex:session-1')
+  await expect(source).toContainText('we agreed guests can check out')
+  await expect(source).toContainText('version 1')
+})
+
+
+test('evidence citations navigate to their matching excerpt', async ({ page }) => {
+  await page.goto(process.env.VIEWER_URL!)
+  await page.locator('summary', { hasText: 'Saved carts' }).click()
+  await page.getByRole('button', { name: 'Open evidence codex:session-1' }).click()
+  await expect(page.getByRole('region', { name: 'Source evidence' })).toContainText('we agreed guests can check out')
+})

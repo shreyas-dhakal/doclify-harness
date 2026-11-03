@@ -417,6 +417,7 @@ dependencies = [
  "axum",
  "cap-std",
  "doclify-domain",
+ "doclify-evidence",
  "doclify-search",
  "http-body-util",
  "mime_guess",

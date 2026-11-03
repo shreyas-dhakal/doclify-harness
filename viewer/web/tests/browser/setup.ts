@@ -14,6 +14,8 @@ import Chart from "./chart"
 
 Guests can buy without an account.
 
+[Source excerpt](../../.doclify/records/decision-1/00000000000000000001.json)
+
 <Decision id="decision-1" status="accepted">
 
 Use **guest** checkout.
@@ -36,7 +38,7 @@ const x = <b>{1}</b>
 Closing *line*.
 `
 
-const record = (id: string, kind: string, title: string) => JSON.stringify({ schema_version: 1, record: { id, version: 1, kind, title, statement: `${title} statement`, rationale: `${title} rationale`, review: 'proposed', implementation: 'planned', experiment_outcome: null, provenance: [{ source: 'codex:session-1', excerpt: 'we agreed guests can check out' }], evidence: ['src/checkout.ts'], supersedes: null } })
+const record = (id: string, kind: string, title: string) => JSON.stringify({ schema_version: 1, record: { id, version: 1, kind, title, statement: `${title} statement`, rationale: `${title} rationale`, review: 'proposed', implementation: 'planned', experiment_outcome: null, provenance: [{ source: 'codex:session-1', excerpt: 'we agreed guests can check out' }], evidence: ['codex:session-1', 'src/checkout.ts'], supersedes: null } })
 
 export default async function setup() {
   const repo = mkdtempSync(join(tmpdir(), 'doclify-viewer-'))

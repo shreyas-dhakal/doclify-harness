@@ -40,6 +40,7 @@ struct Entry {
 }
 
 pub fn generate(repo: &Path, evidence: Option<&Evidence>) -> io::Result<Report> {
+    let _lock = lock_docs(repo)?;
     let store = Store::open(repo)?;
     let mut entries = Vec::new();
     for history in load_records(repo)? {
@@ -71,11 +72,22 @@ pub fn resolve_conflict(repo: &Path, name: &str) -> io::Result<()> {
     if !PAGES.contains(&name) {
         return Err(crate::invalid("unknown documentation page"));
     }
+    let _lock = lock_docs(repo)?;
     let file = format!("{name}.mdx");
     fs::rename(
         repo.join(".doclify/conflicts").join(&file),
         repo.join(".doclify/generated").join(&file),
     )
+}
+
+// Shared with the viewer: keep the directory descriptor locked for the whole
+// read/merge/write transaction, including baseline and conflict updates.
+fn lock_docs(repo: &Path) -> io::Result<fs::File> {
+    let dir = repo.join("docs/doclify");
+    fs::create_dir_all(&dir)?;
+    let lock = fs::File::open(dir)?;
+    lock.lock()?;
+    Ok(lock)
 }
 
 fn reconcile(repo: &Path, name: &str, new: &str, report: &mut Report) -> io::Result<()> {
@@ -292,10 +304,11 @@ fn record(s: &mut String, r: &Record, evidence: Option<&Evidence>) {
         "- Rationale: {}",
         if r.rationale.trim().is_empty() { "Unknown.".into() } else { esc(&r.rationale) }
     );
+    let source_link = format!("../../.doclify/records/{}/{:020}.json", r.id, r.version);
     for p in &r.provenance {
         match &p.excerpt {
-            Some(x) => { let _ = writeln!(s, "- Source {}: \"{}\"", code(&p.source), esc(x)); }
-            None => { let _ = writeln!(s, "- Source {}", code(&p.source)); }
+            Some(x) => { let _ = writeln!(s, "- Source [{}]({}): \"{}\"", code(&p.source), source_link, esc(x)); }
+            None => { let _ = writeln!(s, "- Source [{}]({})", code(&p.source), source_link); }
         }
     }
     for e in &r.evidence {

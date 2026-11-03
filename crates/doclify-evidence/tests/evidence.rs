@@ -156,7 +156,7 @@ fn standard_docs_separate_states_and_keep_unknowns() {
     assert!(accepted.contains("`decision-guest-checkout@v2`"));
     assert!(accepted.contains("Review: accepted | Implementation: planned"));
     assert!(accepted.contains("Rationale: Customers abandon checkout"));
-    assert!(accepted.contains("Source `codex:guest-checkout-session`: \"Customers abandon account creation during checkout.\""));
+    assert!(accepted.contains("Source [`codex:guest-checkout-session`](../../.doclify/records/decision-guest-checkout/00000000000000000002.json): \"Customers abandon account creation during checkout.\""));
     assert!(read("overview").contains("Unknown: no reviewed record"));
     assert!(read("architecture").contains("`Cargo.toml`"));
     assert!(read("setup").contains("`README.md`"));
@@ -365,4 +365,36 @@ fn non_overlapping_human_edits_merge_with_regeneration() {
     assert_eq!(fs::read_dir(repo.join(".doclify/conflicts")).unwrap().count(), 0, "temp files removed");
     // The merged page is stable on the next run.
     assert_eq!(docs::generate(repo, None).unwrap().kept_human, vec!["requirements"]);
+}
+
+#[test]
+fn generation_waits_for_document_lock_and_keeps_intervening_edit() {
+    let dir = fixture_repo();
+    let repo = dir.path();
+    docs::generate(repo, None).unwrap();
+    let lock = fs::File::open(repo.join("docs/doclify")).unwrap();
+    lock.lock().unwrap();
+    let path = repo.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || { tx.send(docs::generate(&path, None).unwrap()).unwrap(); });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "generator bypassed viewer lock");
+    fs::write(repo.join("docs/doclify/overview.mdx"), "human edit\n").unwrap();
+    drop(lock);
+    let report = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    worker.join().unwrap();
+    assert!(report.kept_human.contains(&"overview".to_string()));
+    assert_eq!(fs::read_to_string(repo.join("docs/doclify/overview.mdx")).unwrap(), "human edit\n");
+}
+
+#[test]
+fn provenance_links_to_portable_record_with_excerpt_in_clone() {
+    let dir = fixture_repo();
+    docs::generate(dir.path(), None).unwrap();
+    let page = fs::read_to_string(dir.path().join("docs/doclify/decisions.mdx")).unwrap();
+    let link = "../../.doclify/records/decision-guest-checkout/00000000000000000002.json";
+    assert!(page.contains(&format!("]({link})")), "{page}");
+    let clone = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), clone.path());
+    let source = fs::read_to_string(clone.path().join("docs/doclify").join(link)).unwrap();
+    assert!(source.contains("Customers abandon account creation"));
 }

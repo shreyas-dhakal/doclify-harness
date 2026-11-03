@@ -17,6 +17,7 @@ mime_guess = "2"
 cap-std = "3"
 
 [dev-dependencies]
+doclify-evidence = { path = "../crates/doclify-evidence" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
