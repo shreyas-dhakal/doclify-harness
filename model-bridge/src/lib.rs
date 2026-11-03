@@ -175,3 +175,6 @@ impl Bridge {
         Ok(value.clone())
     }
 }
+
+/// Configured API providers and extraction proposal validation.
+pub mod providers;
