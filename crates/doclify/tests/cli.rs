@@ -362,7 +362,14 @@ fn sync_processes_valid_transcript_hook() {
     fs::create_dir_all(&sessions).unwrap();
     let transcript = sessions.join("session.jsonl");
     fs::write(&transcript, format!("{}\n{}\n", serde_json::json!({"type":"session_meta","payload":{"id":"s","cwd":dir.path()}}), serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}))).unwrap();
-    doclify_capture::hook::enqueue(doclify_capture::Agent::Codex, serde_json::json!({"cwd":dir.path(),"session_id":"s","transcript_path":transcript}).to_string().as_bytes(), dir.path()).unwrap();
+    doclify_capture::hook::enqueue(
+        doclify_capture::Agent::Codex,
+        serde_json::json!({"cwd":dir.path(),"session_id":"s","transcript_path":transcript})
+            .to_string()
+            .as_bytes(),
+        dir.path(),
+    )
+    .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_doclify"))
         .arg("sync")
         .current_dir(dir.path())
@@ -392,11 +399,19 @@ fn sync_processes_valid_transcript_hook() {
 fn sync_waits_for_the_background_worker_queue_lock() {
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
-    Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
     assert!(run(dir.path(), &["init"]).status.success());
     let queue = doclify_capture::queue::Queue::open(dir.path().join(".git/doclify/jobs")).unwrap();
     let held = queue.lock().unwrap();
-    let mut sync = Command::new(env!("CARGO_BIN_EXE_doclify")).arg("sync").current_dir(dir.path()).spawn().unwrap();
+    let mut sync = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .arg("sync")
+        .current_dir(dir.path())
+        .spawn()
+        .unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert!(sync.try_wait().unwrap().is_none());
     drop(held);
@@ -409,20 +424,231 @@ fn linked_worktrees_keep_capture_queues_separate() {
     let repo = dir.path().join("repo");
     let other = dir.path().join("other");
     fs::create_dir(&repo).unwrap();
-    let git = |args: &[&str]| Command::new("git").args(args).current_dir(&repo).status().unwrap();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+    };
     assert!(git(&["init", "-q"]).success());
-    assert!(git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "base"]).success());
+    assert!(git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "base"
+    ])
+    .success());
     assert!(git(&["worktree", "add", "-qb", "other", other.to_str().unwrap()]).success());
     assert!(run(&repo, &["init"]).status.success());
     assert!(run(&other, &["init"]).status.success());
-    doclify_capture::hook::enqueue(doclify_capture::Agent::Codex, br#"{"message":"other worktree"}"#, &other).unwrap();
+    doclify_capture::hook::enqueue(
+        doclify_capture::Agent::Codex,
+        br#"{"message":"other worktree"}"#,
+        &other,
+    )
+    .unwrap();
     assert!(run(&repo, &["sync"]).status.success());
     let other_info = doclify_capture::RepoInfo::discover(&other).unwrap();
-    assert_eq!(doclify_capture::hook::pending(&other_info.queue_dir()).unwrap().len(), 1);
+    assert_eq!(
+        doclify_capture::hook::pending(&other_info.queue_dir())
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(run(&other, &["sync"]).status.success());
-    assert!(doclify_capture::hook::pending(&other_info.queue_dir()).unwrap().is_empty());
+    assert!(doclify_capture::hook::pending(&other_info.queue_dir())
+        .unwrap()
+        .is_empty());
     let main_info = doclify_capture::RepoInfo::discover(&repo).unwrap();
     assert_ne!(main_info.git_dir, other_info.git_dir);
-    assert!(doclify_capture::queue::Queue::open(main_info.git_dir.join("doclify/jobs")).unwrap().pending().unwrap().is_empty());
-    assert_eq!(doclify_capture::queue::Queue::open(other_info.git_dir.join("doclify/jobs")).unwrap().pending().unwrap().len(), 1);
+    assert!(
+        doclify_capture::queue::Queue::open(main_info.git_dir.join("doclify/jobs"))
+            .unwrap()
+            .pending()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        doclify_capture::queue::Queue::open(other_info.git_dir.join("doclify/jobs"))
+            .unwrap()
+            .pending()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn repl_request_persists_proposal_for_explicit_review() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .propose(&Record {
+            id: "existing".into(),
+            version: 1,
+            kind: RecordKind::Decision,
+            title: "Existing".into(),
+            statement: "Existing policy".into(),
+            rationale: "reason".into(),
+            review: ReviewState::Proposed,
+            implementation: ImplementationState::Unknown,
+            experiment_outcome: None,
+            provenance: vec![Provenance {
+                source: "source".into(),
+                excerpt: None,
+            }],
+            evidence: vec!["evidence-123".into()],
+            supersedes: None,
+        })
+        .unwrap();
+    store.review("existing", 1, ReviewState::Accepted).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    assert!(run(
+        dir.path(),
+        &[
+            "model",
+            "set",
+            "openai",
+            &url,
+            "DOCLIFY_REPL_KEY",
+            "fixture"
+        ]
+    )
+    .status
+    .success());
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("no request: {e}"),
+            }
+        };
+        let mut data = Vec::new();
+        let mut buf = [0; 4096];
+        let offset = loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+            if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&data[..offset]);
+        let length: usize = headers
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, v)| v.trim().parse().unwrap())
+            })
+            .unwrap();
+        while data.len() < offset + length {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+        }
+        assert!(String::from_utf8_lossy(&data[offset..]).contains("evidence-123"));
+        let result = serde_json::json!({"answer":"Suggested change", "proposals":[{"kind":"decision","summary":"New policy","review":"proposed","evidence":["evidence-123"]}]}).to_string();
+        let response = serde_json::json!({"choices":[{"message":{"content":result}}]}).to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .current_dir(dir.path())
+        .env("DOCLIFY_REPL_KEY", "fixture")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Update the policy\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Suggested change"));
+    let pending: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), &["review"]).stdout).unwrap();
+    assert_eq!(pending["pending_review"][0]["statement"], "New policy");
+    assert_eq!(pending["pending_review"][0]["review"], "proposed");
+}
+
+#[test]
+fn repl_discovers_filters_and_selects_api_model_without_losing_configuration() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    assert!(run(
+        dir.path(),
+        &["model", "set", "openai", &url, "DOCLIFY_REPL_KEY", "old"]
+    )
+    .status
+    .success());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /models "));
+        let body = r#"{"data":[{"id":"Alpha-Model"},{"id":"Beta-Model"}]}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .current_dir(dir.path())
+        .env("DOCLIFY_REPL_KEY", "fixture")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/model\nBETA\n1\n/quit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let selected: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".git/doclify/model.json")).unwrap())
+            .unwrap();
+    assert_eq!(selected["model"], "Beta-Model");
+    assert_eq!(selected["provider"], "openai");
+    assert_eq!(selected["base_url"], url);
+    assert_eq!(selected["api_key_env"], "DOCLIFY_REPL_KEY");
 }
