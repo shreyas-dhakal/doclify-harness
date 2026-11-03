@@ -12,16 +12,6 @@ Read-only evidence sync and standard documentation generation (delivery phase 4)
 
 Limits: merging is line-based; adjacent edits conflict. Each sync rescans up to `max_commits` (default 500) with no checkpoint. Test runners are a fixed list, and any non-doc change makes a run stale (no test-to-path mapping). Inline PR review comments are not fetched.
 
-## Integration
+## CLI integration
 
-1. Add `"crates/doclify-evidence"` to `members` in the root `Cargo.toml` and run `cargo test -p doclify-evidence`. The crate needs no new dependencies outside the lockfile.
-2. In `crates/doclify`, add `doclify-evidence = { path = "../doclify-evidence" }` and wire `/sync` (`doclify sync`) as:
-   ```rust
-   let local = repo.common_dir.join("doclify"); // shared by worktrees, never tracked
-   let captured: Vec<serde_json::Value> = /* hook events and done/pending capture jobs */;
-   let options = doclify_evidence::SyncOptions { captured: &captured, ..Default::default() };
-   let evidence = doclify_evidence::sync(&repo.worktree, &local, &options)?;
-   let report = doclify_evidence::docs::generate(&repo.worktree, Some(&evidence))?;
-   Ok(json!({"commits": evidence.commits.len(), "github": evidence.github, "links": evidence.links, "tests": evidence.tests, "sessions": evidence.sessions, "docs": report}))
-   ```
-   Report `Github::Unavailable` in `/status` as an integration failure, not as an error.
+`doclify sync` collects evidence and generates pages for the current worktree. The CLI uses worktree-local Git storage for the evidence snapshot and captured jobs.

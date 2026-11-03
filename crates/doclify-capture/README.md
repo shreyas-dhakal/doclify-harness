@@ -2,7 +2,7 @@
 
 Phase 2 capture slice: agent hooks → local queue, versioned transcript readers, additive hook install/uninstall, and SessionStart context delivery via `doclify-context`.
 
-Verified against Codex CLI 0.166.0 and Claude Code 2.1.308 (2026-11-03).
+CLI versions inspected during development: Codex 0.166.0 and Claude Code 2.1.308 (2026-11-03). Live authenticated capture compatibility has not been established.
 
 ## How it works
 
@@ -14,18 +14,15 @@ Verified against Codex CLI 0.166.0 and Claude Code 2.1.308 (2026-11-03).
 - `uninstall` removes only handlers whose command starts with `: doclify-hook=1;`, plus groups/events/`hooks` it emptied.
 - `transcript::read(agent, path, offset)` returns entries (User/Assistant/ToolCall/ToolResult/SessionMeta with stable ids), the next offset, and an `unsupported` list. Partial trailing lines are deferred. A file that shrank is re-read from 0; ids make the replay idempotent.
 
-## Integrating into `doclify`
+## CLI integration
 
-1. Add `crates/doclify-capture` to the workspace members.
-2. Route `doclify hook <agent>` → `doclify_capture::hook::run`, and `doclify init` / uninstall → `install::install(&repo, "doclify")` / `install::uninstall`. Then change `install::DEFAULT_EXE` to `"doclify"` and drop `src/main.rs`.
-3. Worker: `hook::pending(queue_dir)` → for each event, read `payload.transcript_path` from its stored cursor with `transcript::read` → persist entries keyed by `(agent, session_id, entry.id)` → store the cursor → delete the event file. Delete only after persisting, so a crash replays events instead of losing them. Surface `unsupported` in `/status` and `doctor`.
-4. Set `DOCLIFY_BRIDGE=1` in the env of every model-bridge subprocess.
+`doclify init`, `doclify uninstall`, and `doclify hook <agent>` use this library. Hooks enqueue events and the CLI starts a background sync worker. The pipeline reconciles recognized sessions under the configured agent roots and validates hook transcript ownership before import. Bridge subprocesses use capture-suppression markers.
 
 ## Limitations
 
-- Codex runs project hooks only in a trusted project and only after the user approves them in Codex's `/hooks` view (hash-based trust in `~/.codex/config.toml`). Doclify does not write trust state. Until the user approves, Codex capture is inactive, so `doctor` should report it.
+- Codex runs project hooks only in a trusted project and only after the user approves them in Codex's `/hooks` view (hash-based trust in `~/.codex/config.toml`). Doclify does not write trust state. Until the user approves, Codex capture is inactive. `doctor` reports approval as unverified.
 - Transcript formats are undocumented. Unknown line types are reported in `unsupported`, not dropped silently. Run the opt-in check against real files after agent upgrades:
   `DOCLIFY_REAL_CODEX=<rollout.jsonl> DOCLIFY_REAL_CLAUDE=<session.jsonl> cargo test -- --ignored`
-- Not yet implemented: the reconciliation scan of `~/.codex/sessions` and `~/.claude/projects` for sessions whose hooks never fired, and parent-session linkage. Subagent transcripts are captured only through `agent_transcript_path` in the raw payload.
+- Reconciliation scans supported session roots but requires recognizable session metadata; parent-session linkage is not implemented. Subagent transcript paths may appear in raw payloads.
 
 Linked worktrees have separate hook queues, jobs, checkpoints, and extraction outputs under their own Git directories; run `doclify init` in each worktree. Older shared queues and jobs remain in the common Git directory and are not automatically reassigned to linked worktrees; inspect them before manually recovering any pending work. Rejected hook files are retained in the worktree queue’s `rejected` directory and counted by `status` and `sync`.

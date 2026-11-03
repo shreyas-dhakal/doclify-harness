@@ -1,6 +1,6 @@
 # Doclify: Rust documentation harness
 
-Status: planning complete; implementation has not started.
+Status: historical product plan; implementation is underway. The README describes the current interface and verified limitations. Items below are goals, not claims of completed behavior.
 Last updated: 2026-11-03.
 
 ## Purpose and success
@@ -168,8 +168,6 @@ At planning time the repository was empty except for `.git`. Available local too
 - [Claude Code programmatic execution](https://code.claude.com/docs/en/headless) describes print-mode execution.
 - Local CLI help confirmed noninteractive execution and structured-output options for both agents. Authenticated inference, capture correctness, and hook installation have not yet been tested.
 
-## Resume here
+## Current implementation checkpoint
 
-No product code, dependencies, hook configuration, or credentials have been created or changed. This plan is the saved handoff; implementation remains pending.
-
-On resuming, read this file, check repository instructions and current tool versions, and convert the first delivery phase into actionable implementation tasks. Preserve the confirmed product decisions above; clearly label any new assumptions. Verify bridge constraints and hook/transcript compatibility against the installed versions before relying on them. Do not start by building a standalone coding agent or treating all captured session text as permanent instructions.
+The workspace now contains the CLI, capture, domain, pipeline, evidence, context, model bridge, and viewer crates. Consult the README and crate documentation for current setup and limitations. The original acceptance criteria above remain targets; synthetic tests do not establish live agent compatibility or the complete guest-checkout handover.
