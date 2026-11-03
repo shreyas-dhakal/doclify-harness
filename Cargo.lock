@@ -248,6 +248,8 @@ name = "doclify-pipeline"
 version = "0.1.0"
 dependencies = [
  "doclify-capture",
+ "doclify-domain",
+ "doclify-model-bridge",
  "serde_json",
  "tempfile",
 ]
