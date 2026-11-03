@@ -131,6 +131,38 @@ impl ApiProvider {
             })
             .collect()
     }
+    /// Answer a documentation request; returned proposals remain unaccepted and unwritten.
+    pub fn documentation(
+        &self,
+        model: &str,
+        question: &str,
+        context: &str,
+    ) -> Result<crate::documentation::DocumentationResponse, String> {
+        if model.trim().is_empty() {
+            return Err("model identifier is empty".into());
+        }
+        let prompt = crate::documentation::prompt(question, context)?;
+        let schema = crate::documentation::schema();
+        let (suffix, body) = match self.kind {
+            ApiKind::OpenAiCompatible => (
+                "chat/completions",
+                json!({"model":model,"messages":[{"role":"system","content":crate::documentation::INSTRUCTION},{"role":"user","content":prompt}],"response_format":{"type":"json_schema","json_schema":{"name":"documentation_response","strict":true,"schema":schema}}}),
+            ),
+            ApiKind::Anthropic => (
+                "messages",
+                json!({"model":model,"max_tokens":4096,"system":format!("{} JSON schema: {}", crate::documentation::INSTRUCTION, schema),"messages":[{"role":"user","content":prompt}]}),
+            ),
+        };
+        let value = Self::response(self.request(reqwest::Method::POST, suffix)?.json(&body))?;
+        let text = match self.kind {
+            ApiKind::OpenAiCompatible => value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            ApiKind::Anthropic => value.pointer("/content/0/text").and_then(Value::as_str),
+        }
+        .ok_or("provider omitted response text")?;
+        crate::documentation::validate_response(text)
+    }
     pub fn extract(&self, model: &str, input: &str) -> Result<ProposalBatch, String> {
         if model.trim().is_empty() {
             return Err("model identifier is empty".into());
