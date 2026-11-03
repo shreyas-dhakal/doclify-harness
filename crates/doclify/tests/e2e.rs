@@ -305,10 +305,12 @@ fn guest_checkout_handover_from_codex_to_claude() {
     let hook = json!({"hook_event_name":"UserPromptSubmit","session_id":session,"cwd":env.repo,"transcript_path":rollout,"prompt":prompt});
     assert!(env.hook(&env.repo, "codex", &hook).stdout.is_empty());
     env.hook(&env.repo, "codex", &json!({"hook_event_name":"Stop","session_id":session,"cwd":env.repo,"transcript_path":rollout}));
-    assert_eq!(env.json(&env.repo, &["status"])["pending_events"], 2);
 
     let synced = sync(&env, &env.repo);
     assert_eq!(synced["pending_extraction"], 0, "{synced:#}");
+    let status = env.json(&env.repo, &["status"]);
+    assert_eq!(status["pending_events"], 0, "{status:#}");
+    assert_eq!(status["rejected_events"], 0, "both hooks accepted: {status:#}");
 
     // Nothing is accepted by extraction.
     let pending = env.pending_review(&env.repo);
@@ -390,10 +392,12 @@ fn guest_checkout_handover_from_codex_to_claude() {
     );
 }
 
-/// A session in a linked worktree is captured into the shared queue once, and
-/// its proposal is reviewable where the session ran, whichever worktree syncs.
+/// Each linked worktree is initialized separately and owns its capture queue,
+/// jobs, and outputs (the model selection is shared through the common Git
+/// directory). A session in a linked worktree is captured and extracted once,
+/// only there, whichever worktree syncs.
 #[test]
-fn linked_worktree_capture_is_shared_and_not_duplicated() {
+fn linked_worktree_capture_is_isolated_and_not_duplicated() {
     let env = Env::new();
     let provider = Provider::start();
     env.use_provider(&env.repo, &provider);
@@ -404,30 +408,28 @@ fn linked_worktree_capture_is_shared_and_not_duplicated() {
     );
     assert_eq!(
         env.json(&wt, &["status"])["registered"],
-        true,
-        "worktrees share registration"
+        false,
+        "registration is per worktree"
     );
+    env.json(&wt, &["init"]);
+    assert_eq!(env.json(&wt, &["status"])["registered"], true);
     let out = env.hook(&wt, "claude", &json!({"hook_event_name":"UserPromptSubmit","session_id":"wt-1","cwd":wt,"prompt":"[[decision|Sessions expire after 30 minutes]]"}));
     assert!(out.stdout.is_empty());
     assert_eq!(
         env.json(&env.repo, &["status"])["pending_events"],
-        1,
-        "queue lives in the common dir"
+        0,
+        "the main worktree's queue never sees linked-worktree events"
     );
     sync(&env, &env.repo);
     sync(&env, &wt);
-    let all: Vec<Value> = [&env.repo, &wt]
-        .iter()
-        .flat_map(|d| env.pending_review(d))
-        .collect();
-    assert_eq!(
-        all.iter()
-            .filter(|r| r["statement"] == "Sessions expire after 30 minutes")
-            .count(),
-        1,
-        "{all:#?}"
-    );
-    find(&env.pending_review(&wt), "Sessions expire after 30 minutes");
+    assert!(env.pending_review(&env.repo).is_empty());
+    let status = env.json(&wt, &["status"]);
+    assert_eq!(status["pending_events"], 0, "{status:#}");
+    assert_eq!(status["rejected_events"], 0, "{status:#}");
+    let records = env.pending_review(&wt);
+    find(&records, "Sessions expire after 30 minutes");
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(provider.count(), 1, "extracted exactly once");
 }
 
 /// Provider failure, a killed sync, and restarts neither lose nor duplicate work,
@@ -526,7 +528,8 @@ fn concurrent_hooks_and_syncs_extract_each_event_once() {
             });
         }
     });
-    assert_eq!(env.json(&env.repo, &["status"])["pending_events"], HOOKS);
+    // Hooks spawn background workers that may already be draining the queue, so
+    // a pending count here would race; the final state below proves no loss.
 
     let outputs: Vec<Output> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..4)
@@ -549,6 +552,9 @@ fn concurrent_hooks_and_syncs_extract_each_event_once() {
         find(&pending, &format!("Concurrent task {i}"));
     }
     assert_eq!(provider.count(), HOOKS, "each event extracted exactly once");
+    let status = env.json(&env.repo, &["status"]);
+    assert_eq!(status["pending_events"], 0, "{status:#}");
+    assert_eq!(status["rejected_events"], 0, "{status:#}");
 }
 
 /// Copies the built executable outside the source tree and runs `doclify docs`
