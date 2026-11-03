@@ -310,7 +310,10 @@ fn guest_checkout_handover_from_codex_to_claude() {
     assert_eq!(synced["pending_extraction"], 0, "{synced:#}");
     let status = env.json(&env.repo, &["status"]);
     assert_eq!(status["pending_events"], 0, "{status:#}");
-    assert_eq!(status["rejected_events"], 0, "both hooks accepted: {status:#}");
+    assert_eq!(
+        status["rejected_events"], 0,
+        "both hooks accepted: {status:#}"
+    );
 
     // Nothing is accepted by extraction.
     let pending = env.pending_review(&env.repo);
@@ -392,7 +395,7 @@ fn guest_checkout_handover_from_codex_to_claude() {
     );
 }
 
-/// Each linked worktree is initialized separately and owns its capture queue,
+/// Linked worktrees share registration and each owns its capture queue,
 /// jobs, and outputs (the model selection is shared through the common Git
 /// directory). A session in a linked worktree is captured and extracted once,
 /// only there, whichever worktree syncs.
@@ -408,11 +411,9 @@ fn linked_worktree_capture_is_isolated_and_not_duplicated() {
     );
     assert_eq!(
         env.json(&wt, &["status"])["registered"],
-        false,
-        "registration is per worktree"
+        true,
+        "registration is shared by linked worktrees"
     );
-    env.json(&wt, &["init"]);
-    assert_eq!(env.json(&wt, &["status"])["registered"], true);
     let out = env.hook(&wt, "claude", &json!({"hook_event_name":"UserPromptSubmit","session_id":"wt-1","cwd":wt,"prompt":"[[decision|Sessions expire after 30 minutes]]"}));
     assert!(out.stdout.is_empty());
     assert_eq!(
@@ -429,6 +430,8 @@ fn linked_worktree_capture_is_isolated_and_not_duplicated() {
     let records = env.pending_review(&wt);
     find(&records, "Sessions expire after 30 minutes");
     assert_eq!(records.len(), 1, "{records:#?}");
+    sync(&env, &wt);
+    assert_eq!(env.pending_review(&wt).len(), 1, "restart preserves the completed result");
     assert_eq!(provider.count(), 1, "extracted exactly once");
 }
 

@@ -49,10 +49,18 @@ pub fn session_context(raw: &[u8], fallback_cwd: &Path) -> Option<String> {
     // ponytail: second `git rev-parse` after enqueue's; share RepoInfo if hook latency matters.
     let repo = RepoInfo::discover(&cwd)?;
     let scope = doclify_context::Scope {
-        branch: repo.branch,
+        branch: repo.branch.clone(),
         topic: None,
     };
-    let context = doclify_context::build(&repo.worktree, &scope, &Default::default()).ok()??;
+    let context = doclify_context::build(&repo.worktree, &scope, &Default::default())
+        .ok()?
+        .or_else(|| {
+            if !repo.registered() {
+                return None;
+            }
+            let primary = repo.primary_worktree()?;
+            doclify_context::build(&primary, &scope, &Default::default()).ok()?
+        })?;
     let out = json!({
         "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context.render() }
     });
@@ -71,10 +79,11 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
     let Some(repo) = RepoInfo::discover(&cwd) else {
         return Ok(None);
     };
-    let dir = repo.queue_dir();
-    if !dir.is_dir() {
+    if !repo.registered() {
         return Ok(None);
     }
+    let dir = repo.queue_dir();
+    fs::create_dir_all(&dir)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

@@ -104,7 +104,28 @@ impl RepoInfo {
         })
     }
 
-    /// Existence of this directory is what "registered repository" means for capture.
+    /// Repository registration is shared through Git’s common directory.
+    pub fn registered(&self) -> bool {
+        self.common_dir.join("doclify/queue").is_dir()
+    }
+
+    /// Primary worktree, used as a fallback for reviewed repository context.
+    pub fn primary_worktree(&self) -> Option<PathBuf> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.worktree)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        text.lines()
+            .find_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+    }
+
+    /// Capture queues remain local to each worktree for attribution and recovery.
     pub fn queue_dir(&self) -> PathBuf {
         self.git_dir.join("doclify").join("queue")
     }

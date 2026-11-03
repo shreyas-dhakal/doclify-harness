@@ -39,6 +39,7 @@ pub fn hook_command(exe: &str, agent: Agent) -> String {
 
 /// Registers the repository for capture and installs both agents' hooks.
 pub fn install(repo: &RepoInfo, exe: &str) -> io::Result<Vec<PathBuf>> {
+    fs::create_dir_all(repo.common_dir.join("doclify/queue"))?;
     fs::create_dir_all(repo.queue_dir())?;
     [Agent::Claude, Agent::Codex]
         .into_iter()
@@ -74,7 +75,9 @@ fn edit(path: &Path, f: impl FnOnce(&mut Map<String, Value>)) -> io::Result<bool
         Err(e) => return Err(e),
     };
     let mut value: Value = serde_json::from_str(&before).map_err(|e| invalid(path, e))?;
-    let root = value.as_object_mut().ok_or_else(|| invalid(path, "top level is not an object"))?;
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| invalid(path, "top level is not an object"))?;
     let original = root.clone();
     f(root);
     if *root == original {
@@ -90,12 +93,17 @@ fn edit(path: &Path, f: impl FnOnce(&mut Map<String, Value>)) -> io::Result<bool
 }
 
 fn invalid(path: &Path, e: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}; not modified", path.display()))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: {e}; not modified", path.display()),
+    )
 }
 
 fn add_ours(root: &mut Map<String, Value>, command: &str) {
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks) = hooks.as_object_mut() else { return };
+    let Some(hooks) = hooks.as_object_mut() else {
+        return;
+    };
     for event in EVENTS {
         let groups = hooks.entry(event).or_insert_with(|| json!([]));
         if let Some(groups) = groups.as_array_mut() {
@@ -107,18 +115,26 @@ fn add_ours(root: &mut Map<String, Value>, command: &str) {
 }
 
 fn is_ours(handler: &Value) -> bool {
-    handler["command"].as_str().is_some_and(|c| c.starts_with(MARKER))
+    handler["command"]
+        .as_str()
+        .is_some_and(|c| c.starts_with(MARKER))
 }
 
 /// Drops our handlers, then any group/event/`hooks` object we emptied.
 fn remove_ours(root: &mut Map<String, Value>) {
-    let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else { return };
+    let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
     let mut emptied_any = false;
     hooks.retain(|_, groups| {
-        let Some(groups) = groups.as_array_mut() else { return true };
+        let Some(groups) = groups.as_array_mut() else {
+            return true;
+        };
         let before = groups.len();
         groups.retain_mut(|group| {
-            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
             let had_ours = handlers.iter().any(is_ours);
             handlers.retain(|h| !is_ours(h));
             !(had_ours && handlers.is_empty())
@@ -171,13 +187,17 @@ mod tests {
 
     #[test]
     fn mixed_group_keeps_foreign_handler() {
-        let mut root: Map<String, Value> = serde_json::from_value(json!({"hooks":{"Stop":[{"hooks":[
-            {"type":"command","command":"keep-me"},
-            {"type":"command","command": hook_command("x", Agent::Claude)}
-        ]}]}}))
-        .unwrap();
+        let mut root: Map<String, Value> =
+            serde_json::from_value(json!({"hooks":{"Stop":[{"hooks":[
+                {"type":"command","command":"keep-me"},
+                {"type":"command","command": hook_command("x", Agent::Claude)}
+            ]}]}}))
+            .unwrap();
         remove_ours(&mut root);
-        assert_eq!(root["hooks"]["Stop"][0]["hooks"], json!([{"type":"command","command":"keep-me"}]));
+        assert_eq!(
+            root["hooks"]["Stop"][0]["hooks"],
+            json!([{"type":"command","command":"keep-me"}])
+        );
     }
 
     #[test]
@@ -185,7 +205,11 @@ mod tests {
         let c = hook_command("/opt/it's/doclify", Agent::Codex);
         assert!(c.starts_with(MARKER));
         assert!(c.contains(r"'/opt/it'\''s/doclify' hook codex"));
-        let out = std::process::Command::new("sh").arg("-c").arg(hook_command("/nonexistent/doclify", Agent::Codex)).output().unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(hook_command("/nonexistent/doclify", Agent::Codex))
+            .output()
+            .unwrap();
         assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
     }
 

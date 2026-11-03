@@ -114,13 +114,16 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             }
             let evidence = doclify_evidence::load(&repo.git_dir.join("doclify"))?;
             Ok(
-                json!({"registered": repo.queue_dir().is_dir(), "pending_events":count, "rejected_events":rejected_count(&repo.queue_dir())?,
+                json!({"registered": repo.registered(), "pending_events":count, "rejected_events":rejected_count(&repo.queue_dir())?,
                 "pending_extraction":queue.pending()?.len(), "pending_review":pending,
                 "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.git_dir.join("doclify/worker-error")).ok(),
                 "codex_hook_approval":"not verified"}),
             )
         }
         ["sync"] => {
+            if repo.registered() {
+                fs::create_dir_all(repo.queue_dir())?;
+            }
             let local = repo.git_dir.join("doclify");
             fs::create_dir_all(&local)?;
             let queue = Queue::open(local.join("jobs"))?;
@@ -191,7 +194,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
         ["doctor"] => {
             let models = model_list(&repo)?;
             Ok(
-                json!({"repository":repo.worktree,"registered":repo.queue_dir().is_dir(),
+                json!({"repository":repo.worktree,"registered":repo.registered(),
                 "hooks":{"claude":install::config_path(&repo.worktree, Agent::Claude).exists(),
                          "codex":install::config_path(&repo.worktree, Agent::Codex).exists(),
                          "codex_approval":"unverified"},"models":models,
