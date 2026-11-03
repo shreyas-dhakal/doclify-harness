@@ -80,3 +80,5 @@ impl RepoInfo {
         self.common_dir.join("doclify").join("queue")
     }
 }
+
+pub mod queue;
