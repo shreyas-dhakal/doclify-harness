@@ -15,6 +15,7 @@ pub fn process(
     output: &Path,
     extractor: &mut impl Extractor,
 ) -> io::Result<usize> {
+    let _lock = capture.lock()?;
     fs::create_dir_all(output)?;
     let mut completed = 0;
     for (id, event) in capture.pending()? {
@@ -121,6 +122,17 @@ impl Extractor for SelectedExtractor {
 /// Extract, validate source references, and import immutable proposed records before acknowledgement.
 /// Serialize this operation for each repository, including across processes.
 pub fn process_proposals(
+    capture: &Queue,
+    output: &Path,
+    store: &doclify_domain::Store,
+    extractor: &mut impl Extractor,
+) -> io::Result<usize> {
+    let _lock = capture.lock()?;
+    process_proposals_locked(capture, output, store, extractor)
+}
+
+/// Caller must hold the queue lock for the entire processing iteration.
+pub fn process_proposals_locked(
     capture: &Queue,
     output: &Path,
     store: &doclify_domain::Store,
@@ -286,63 +298,112 @@ pub fn run_once(
     extractor: &mut impl Extractor,
 ) -> io::Result<usize> {
     let _lock = queue.lock()?;
+    reconcile_repository_locked(queue, hook_dir, repository, sessions)?;
+    process_proposals_locked(queue, output, store, extractor)
+}
+
+/// Reconcile hooks and discover sessions while holding the queue lock.
+pub fn reconcile_repository_locked(
+    queue: &Queue,
+    hook_dir: &Path,
+    repository: &Path,
+    sessions: &[(&str, &Path)],
+) -> io::Result<usize> {
     let repository = repository.canonicalize()?;
-    for (path, event) in doclify_capture::hook::pending(hook_dir)? {
-        if let Some(transcript) = event["payload"]["transcript_path"].as_str() {
-            let agent = event["agent"].as_str().unwrap_or("");
-            let session = event["payload"]["session_id"].as_str().unwrap_or("");
-            let path_obj = Path::new(transcript);
-            let (root, relative) = sessions
-                .iter()
-                .filter(|(name, _)| *name == agent)
-                .find_map(|(_, root)| path_obj.strip_prefix(root).ok().map(|rel| (*root, rel)))
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "transcript outside agent roots",
-                    )
-                })?;
-            let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-            let bytes = dir.read(relative)?;
-            let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
-            let value: Value = serde_json::from_slice(first).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "invalid transcript metadata",
-                )
-            })?;
-            let metadata = match agent {
-                "codex" if value["type"] == "session_meta" => &value["payload"],
-                "claude" => &value,
-                _ => {
+    let mut paths = fs::read_dir(hook_dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    paths.retain(|p| p.extension().is_some_and(|ext| ext == "json"));
+    paths.sort();
+    let mut drained = 0;
+    for path in paths {
+        let result = (|| -> io::Result<()> {
+            let event: Value = serde_json::from_slice(&fs::read(&path)?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if let Some(owner) = event["worktree"].as_str() {
+                if Path::new(owner).canonicalize().ok().as_deref() != Some(repository.as_path()) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "invalid transcript agent",
-                    ))
+                        "hook belongs to another worktree",
+                    ));
                 }
-            };
-            let id = metadata[if agent == "codex" { "id" } else { "sessionId" }].as_str();
-            let owns = metadata["cwd"]
-                .as_str()
-                .and_then(|cwd| Path::new(cwd).canonicalize().ok())
-                .is_some_and(|cwd| cwd.starts_with(&repository));
-            if session.is_empty() || id != Some(session) || !owns {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "transcript session does not belong to repository",
-                ));
             }
-            queue.reconcile_snapshot(&event, &[root], Some(&bytes))?;
-        } else {
-            queue.reconcile(&event)?;
+            if let Some(transcript) = event["payload"]["transcript_path"].as_str() {
+                let agent = event["agent"].as_str().unwrap_or("");
+                let session = event["payload"]["session_id"].as_str().unwrap_or("");
+                let path_obj = Path::new(transcript);
+                let (root, relative) = sessions
+                    .iter()
+                    .filter(|(name, _)| *name == agent)
+                    .find_map(|(_, root)| path_obj.strip_prefix(root).ok().map(|rel| (*root, rel)))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "transcript outside agent roots",
+                        )
+                    })?;
+                let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+                let bytes = dir.read(relative)?;
+                let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+                let value: Value = serde_json::from_slice(first).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "invalid transcript metadata",
+                    )
+                })?;
+                let metadata = match agent {
+                    "codex" if value["type"] == "session_meta" => &value["payload"],
+                    "claude" => &value,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "invalid transcript agent",
+                        ))
+                    }
+                };
+                let id = metadata[if agent == "codex" { "id" } else { "sessionId" }].as_str();
+                let owns = metadata["cwd"]
+                    .as_str()
+                    .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                    .is_some_and(|cwd| cwd.starts_with(&repository));
+                if session.is_empty() || id != Some(session) || !owns {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "transcript session does not belong to repository",
+                    ));
+                }
+                queue.reconcile_snapshot(&event, &[root], Some(&bytes))?;
+            } else {
+                queue.reconcile(&event)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                fs::remove_file(&path)?;
+                drained += 1;
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::NotFound
+                ) =>
+            {
+                let rejected = hook_dir.join("rejected");
+                fs::create_dir_all(&rejected)?;
+                fs::rename(&path, rejected.join(path.file_name().unwrap()))?;
+                fs::File::open(&rejected)?.sync_all()?;
+            }
+            Err(e) => return Err(e),
         }
-        fs::remove_file(path)?;
         fs::File::open(hook_dir)?.sync_all()?;
     }
     for (agent, root) in sessions {
         discover_sessions(queue, &repository, agent, root)?;
     }
-    process_proposals(queue, output, store, extractor)
+    Ok(drained)
 }
 
 /// Owns a background worker; stopping wakes it and waits for its current iteration.
@@ -357,7 +418,7 @@ impl Worker {
     }
 }
 /// Start a periodic serialized worker. The receiver reports every iteration's result;
-/// the caller must ensure no other worker operates on this repository.
+/// Workers operating on the same queue serialize through its shared lock.
 pub fn spawn_worker<E: Extractor + Send + 'static>(
     queue_root: std::path::PathBuf,
     hook_dir: std::path::PathBuf,
