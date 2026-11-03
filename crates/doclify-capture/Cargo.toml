@@ -5,6 +5,7 @@ edition = "2021"
 description = "Codex and Claude Code hook capture, hook installation, and transcript adapters for Doclify"
 
 [dependencies]
+doclify-context = { path = "../doclify-context" }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 

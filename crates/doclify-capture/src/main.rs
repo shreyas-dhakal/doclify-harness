@@ -1,5 +1,5 @@
 //! Standalone capture CLI until the `doclify` executable absorbs these
-//! subcommands. `hook` always exits 0 and prints nothing.
+//! subcommands. `hook` always exits 0 and prints only SessionStart context.
 
 use std::process::ExitCode;
 

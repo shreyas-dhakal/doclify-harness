@@ -81,3 +81,63 @@ fn install_capture_bridge_exclusion_and_uninstall() {
     assert_eq!(fs::read_to_string(dir.join(".codex/hooks.json")).unwrap().trim(), "{}");
     fs::remove_dir_all(dir).unwrap();
 }
+
+fn add_guest_checkout_records(dir: &Path) {
+    fn copy(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for e in fs::read_dir(from).unwrap().map(Result::unwrap) {
+            if e.file_type().unwrap().is_dir() {
+                copy(&e.path(), &to.join(e.file_name()));
+            } else {
+                fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+    }
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../doclify-domain/tests/fixtures/guest-checkout/.doclify");
+    copy(&fixture, &dir.join(".doclify"));
+}
+
+#[test]
+fn session_start_delivers_context_and_other_events_stay_silent() {
+    let dir = git_repo("context");
+    add_guest_checkout_records(&dir);
+    assert!(Command::new(BIN).arg("install").current_dir(&dir).status().unwrap().success());
+
+    for source in ["startup", "resume", "compact"] {
+        let payload = format!(r#"{{"hook_event_name":"SessionStart","source":"{source}","session_id":"s2","cwd":"{}"}}"#, dir.display());
+        for agent in ["claude", "codex"] {
+            let out = run_hook(Path::new("/"), agent, &payload, &[]);
+            assert!(out.status.success() && out.stderr.is_empty());
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+            let context = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+            assert!(context.contains("[requirement-guest-checkout@v2]"));
+            assert!(context.contains("Rationale: Customers abandon checkout"));
+            assert!(!context.contains("Bypass account"));
+        }
+    }
+    // Capture still happened alongside context.
+    assert_eq!(queued(&dir), 6);
+
+    let out = run_hook(&dir, "claude", r#"{"hook_event_name":"UserPromptSubmit","prompt":"hi"}"#, &[]);
+    assert!(out.stdout.is_empty());
+    let out = run_hook(&dir, "claude", r#"{"hook_event_name":"SessionStart"}"#, &[(BRIDGE_ENV, "1")]);
+    assert!(out.stdout.is_empty(), "Doclify's own bridge sessions get no context");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn session_start_fails_open_without_or_with_broken_records() {
+    let dir = git_repo("context-broken");
+    let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
+    let out = run_hook(&dir, "claude", start, &[]);
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+    assert!(!dir.join(".doclify").exists(), "no records directory is created");
+
+    // Unreadable records directory: still exits 0 and prints nothing.
+    fs::create_dir_all(dir.join(".doclify")).unwrap();
+    fs::write(dir.join(".doclify/records"), "not a directory").unwrap();
+    let out = run_hook(&dir, "claude", start, &[]);
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
