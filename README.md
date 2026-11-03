@@ -1,43 +1,59 @@
 # Doclify
 
-Doclify captures supported Codex and Claude Code sessions in a Git worktree, proposes documentation records for review, and generates local documentation. It is an early implementation; transcript formats and live agent integrations may change.
+Doclify captures Codex and Claude Code sessions, turns them into documentation proposals, and carries reviewed decisions into later agent sessions. It runs locally in a Git repository. Decisions become accepted only when you review them.
 
-## Install and set up
+## Setup
 
-Install Rust and Cargo, then from this checkout build a release binary:
+Install Rust and Cargo, then build and install Doclify:
 
 ```sh
+git clone https://github.com/shreyas-dhakal/doclify-harness.git
+cd doclify-harness
 cargo build --release -p doclify
 install -m 755 target/release/doclify /usr/local/bin/doclify
-cd /path/to/your/git/repository
+```
+
+Use another directory on your `PATH` if `/usr/local/bin` is not writable. Node is only needed to rebuild the viewer assets.
+
+In the repository you want to document:
+
+```sh
+cd /path/to/your/repository
 doclify init
+doclify model set claude
 doclify doctor
 ```
 
-Choose another directory on your PATH if `/usr/local/bin` is not writable. Keep `doclify` on PATH for agent hooks. Release builds embed the checked-in `viewer/web/dist` assets; rebuilding those assets requires Node and `npm ci --prefix viewer/web && npm run build --prefix viewer/web` before building the binary. Debug builds read the asset directory at runtime and are not standalone packages.
-
-`init` adds hooks to `.claude/settings.local.json` and `.codex/hooks.json`, preserving other entries. Registration applies to linked worktrees: `init` also adds the hooks to the repository's other worktrees, and worktrees created later receive them the next time an agent session starts in any registered worktree (or when `init` runs there). Existing entries and unparseable files are never rewritten. Codex requires a trusted project and approval in its `/hooks` view; Doclify never writes trust state. `doclify uninstall` removes Doclify hook entries in the current worktree, keeps them from being re-added there until `init` runs again, and retains captured data. It does not revoke Codex trust.
-
-`doctor` reports repository registration, whether the two hook configuration files exist, model capability information, and that transcript compatibility is checked during sync. File existence does **not** prove Doclify hooks are present or working. Codex approval and model authentication are unverified; inspect the agent settings and run a capture/sync to diagnose actual operation.
-
-## Models and workflow
-
-Configure one provider per repository, for example:
+`init` installs agent hooks and configures background recovery. Codex requires you to trust the project and approve the hooks in `/hooks`. The Claude model bridge uses your existing Claude Code login. You can instead configure an OpenAI-compatible API:
 
 ```sh
 export OPENAI_API_KEY='your-key'
 doclify model set openai https://api.openai.com/v1 OPENAI_API_KEY your-model-id
 ```
 
-Use `anthropic` with its versioned API base URL, or `doclify model set claude` for the constrained Claude CLI bridge. The URL must use HTTPS, except for loopback HTTP, and cannot contain credentials, query parameters, or fragments. Credentials are read from the named environment variable, not stored in the configuration. The selected provider receives the relevant capture or documentation context. Selection and CLI capability checks do not prove authentication, availability, or actual CLI enforcement. Codex inference remains disabled because a tool-free mode has not been verified. Claude CLI authentication and effective restrictions need live verification; there is no automatic fallback.
+## Use
 
-Run `doclify` for the interactive prompt. `/model` offers a searchable picker and can discover models for a configured API provider. Ordinary messages request documentation answers and may create proposed records; they do not accept decisions. Use `/review` or `doclify review` to list proposals, then `doclify review <id> <version> accept|reject|supersede` to review explicitly. `/handoff [topic]` and `doclify handoff [topic]` return bounded local context; startup hooks can supply context to agents. Records currently lack path and branch scope, so accepted constraints are treated as repository-wide.
+Run `doclify` for the interactive prompt, or use the commands directly:
 
-`doclify sync` reconciles hooks and supported transcripts, collects local Git and optional read-only `gh` evidence, extracts proposals with the selected model, and generates `docs/doclify/`. Failed extraction remains pending for retry. Hooks start a background sync worker. Init also registers a per-worktree launchd agent on macOS or user systemd timer on Linux, which scans on startup and retries every minute while the user scheduler is running; check the init result and status for registration errors. Linux requires an active user systemd instance (and lingering to run after logout); model credentials must be available to the user scheduler environment. Uninstall disables capture for the current worktree and removes its scheduler entry. `doclify status` shows queues, rejected events, pending reviews, GitHub status, and background errors. Unsupported transcript formats and unauthorized hook paths require investigation; session discovery relies on recognizable metadata and cannot recover every session. Captures and queues are worktree-local; linked worktrees merge reviewed records with the primary worktree, choosing the higher latest version and local copy on ties. Older shared queues are not automatically reassigned.
+```sh
+doclify sync                    # capture sessions and update documentation
+doclify status                  # inspect capture and review queues
+doclify review                  # list proposals
+doclify review <id> <version> accept
+doclify handoff "authentication" # get reviewed context for another session
+doclify docs                    # open the local viewer and editor
+```
 
+In the prompt, use `/model`, `/sync`, `/review`, `/handoff`, `/docs`, `/status`, and `/quit`. Generated documentation is stored in `docs/doclify/`; reviewed records are stored in `.doclify/records/`. Share them through your normal Git workflow.
 
-`doclify docs` opens the loopback viewer; keep the process running. `/docs` keeps it available until the REPL exits. Saves use revision checks; generated-page conflicts are retained under `.doclify/conflicts/` rather than overwriting overlapping edits. Raw captures and local jobs may contain sensitive session content. Review generated records and documentation before sharing them through Git.
+The Codex documentation-model bridge is currently disabled because the installed CLI does not provide a verified tool-free mode. Codex session capture remains supported. See [live verification](docs/live-verification.md) for the tested agent versions and known limitations.
 
-## Validation
+## Development
 
-`cargo test --workspace --no-fail-fast` runs the Rust suite. The end-to-end tests use temporary Git repositories, synthetic agent transcripts, and a loopback fake model provider; they do not establish compatibility with authenticated live agents or providers. Run `cargo test --release -p doclify --test e2e -- release_binary_embeds_viewer_assets` to exercise the release binary outside the source tree. Viewer frontend checks require `npm ci --prefix viewer/web` and `npm test --prefix viewer/web` plus the Playwright browser dependencies.
+```sh
+cargo test --workspace
+npm ci --prefix viewer/web
+npm test --prefix viewer/web
+```
+
+To rebuild the embedded viewer assets before a release build, run `npm run build --prefix viewer/web`. Use `doclify uninstall` in a repository to remove its hooks and recovery entry; captured data is retained.
