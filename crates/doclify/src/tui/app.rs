@@ -5,14 +5,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use doclify_capture::RepoInfo;
 use super::{
     commands::{self, ActionResult, ModelChoice},
     terminal::Session,
     ui,
     workflow::{self, WorkflowSnapshot},
 };
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use doclify_capture::RepoInfo;
 
 #[derive(Clone)]
 pub struct Message {
@@ -45,14 +45,14 @@ impl App {
             loading: true,
             messages: vec![Message {
                 role: "doclify",
-                text: "Ready when you are. Ask a question or enter a slash command.".into(),
+                text: "Tell me what the docs should explain. Type /help to see commands.".into(),
             }],
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
             history_position: None,
             conversation_from_bottom: 0,
-            status: "Loading repository workflow…".into(),
+            status: "Loading…".into(),
             busy: false,
             model_choices: None,
             model_selection: 0,
@@ -103,7 +103,9 @@ impl App {
         thread::spawn(move || {
             let result = commands::choose_model(&choice)
                 .map(ActionResult::Message)
-                .unwrap_or_else(|error| ActionResult::Message(format!("Model selection failed: {error}")));
+                .unwrap_or_else(|error| {
+                    ActionResult::Message(format!("Couldn't choose that AI: {error}"))
+                });
             let _ = sender.send(result);
         });
         Some(receiver)
@@ -182,7 +184,8 @@ fn refresh() -> Receiver<Refresh> {
         let result = std::env::current_dir()
             .map_err(|error| error.to_string())
             .and_then(|cwd| {
-                RepoInfo::discover(&cwd).ok_or_else(|| "Not inside a Git repository".to_string())
+                RepoInfo::discover(&cwd)
+                    .ok_or_else(|| "Open Doclify from inside a Git project.".to_string())
             })
             .and_then(|repo| workflow::load(&repo).map_err(|error| error.to_string()));
         let _ = sender.send(result);
@@ -205,31 +208,51 @@ pub fn run() -> io::Result<()> {
                     match result {
                         Ok(snapshot) => {
                             let first_load = app.snapshot.is_none();
-                            app.status = snapshot
-                                .background_error
-                                .as_deref()
-                                .or(snapshot.recovery_error.as_deref())
-                                .map(|error| format!("Workflow warning · {error}"))
-                                .unwrap_or_else(|| "Workflow ready".into());
+                            app.status = if snapshot.background_error.is_some()
+                                || snapshot.recovery_error.is_some()
+                            {
+                                "Needs attention".into()
+                            } else {
+                                "Ready".into()
+                            };
+                            if first_load && snapshot.background_error.is_some() {
+                                app.messages.push(Message {
+                                    role: "doclify",
+                                    text: "Doclify couldn't finish processing saved sessions. They're still saved; run `/sync` to try again.".into(),
+                                });
+                            }
+                            if first_load && snapshot.recovery_error.is_some() {
+                                app.messages.push(Message {
+                                    role: "doclify",
+                                    text: "Automatic session recovery isn't running. Run `doclify doctor` to see how to fix it.".into(),
+                                });
+                            }
                             if first_load && snapshot.model.is_none() {
                                 app.messages.push(Message {
                                     role: "doclify",
-                                    text: "Choose a model with /model, then ask what this repository should document. Requests create proposals for review; they are not accepted automatically.".into(),
+                                    text: "Choose an AI with /model, then describe what the docs should explain. Doclify will draft suggestions for you to review before adding them.".into(),
                                 });
                             }
                             if first_load
-                                && snapshot.registration == workflow::RegistrationState::NotRegistered
+                                && snapshot.registration
+                                    == workflow::RegistrationState::NotRegistered
                             {
                                 app.messages.push(Message {
                                     role: "doclify",
-                                    text: "Hooks are not initialized here yet. Run doclify init in this repository to enable session capture.".into(),
+                                    text: "Session capture isn't set up in this folder yet. Run `doclify init` here to save your coding sessions.".into(),
                                 });
                             }
                             app.snapshot = Some(snapshot);
                         }
-                        Err(error) => {
-                            app.load_error = Some(error.clone());
-                            app.status = format!("Workflow unavailable · {error}");
+                        Err(_error) => {
+                            if app.load_error.is_none() {
+                                app.messages.push(Message {
+                                    role: "doclify",
+                                    text: "Couldn't load this project's status. Run `doclify doctor` to see what needs fixing.".into(),
+                                });
+                            }
+                            app.load_error = Some("Can't load status".into());
+                            app.status = "Can't load status".into();
                         }
                     }
                     last_refresh = Instant::now();
@@ -246,20 +269,27 @@ pub fn run() -> io::Result<()> {
                     app.busy = false;
                     match result {
                         ActionResult::Message(text) => {
-                            app.status = text.lines().next().unwrap_or("Done").to_owned();
-                            app.messages.push(Message { role: "doclify", text });
+                            app.status = if text.starts_with("Couldn't") {
+                                "Error".into()
+                            } else {
+                                "Ready".into()
+                            };
+                            app.messages.push(Message {
+                                role: "doclify",
+                                text,
+                            });
                             app.conversation_from_bottom = 0;
                         }
                         ActionResult::ModelChoices(choices) => {
                             if choices.is_empty() {
                                 app.messages.push(Message {
                                     role: "doclify",
-                                    text: "No model choices are available. Configure an API provider with `doclify init --model openai|anthropic …` first.".into(),
+                                    text: "No AI choices found. Check your setup with `doclify doctor`.".into(),
                                 });
                             } else {
                                 app.model_selection = 0;
                                 app.model_choices = Some(choices);
-                                app.status = "Choose a model · ↑/↓ move · Enter select · Esc cancel".into();
+                                app.status = "Choose AI".into();
                             }
                         }
                         ActionResult::Quit => app.should_quit = true,
@@ -269,7 +299,7 @@ pub fn run() -> io::Result<()> {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     action_receiver = None;
                     app.busy = false;
-                    app.status = "Action stopped unexpectedly".into();
+                    app.status = "Try again".into();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -282,9 +312,7 @@ pub fn run() -> io::Result<()> {
             refresh_receiver = Some(refresh());
         }
 
-        session
-            .terminal()
-            .draw(|frame| ui::draw(frame, &mut app))?;
+        session.terminal().draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == event::KeyEventKind::Press => {
@@ -294,12 +322,13 @@ pub fn run() -> io::Result<()> {
                                 app.model_selection = app.model_selection.saturating_sub(1);
                             }
                             KeyCode::Down => {
-                                app.model_selection = (app.model_selection + 1).min(choices.len() - 1);
+                                app.model_selection =
+                                    (app.model_selection + 1).min(choices.len() - 1);
                             }
                             KeyCode::Enter => action_receiver = app.choose_model(),
                             KeyCode::Esc => {
                                 app.model_choices = None;
-                                app.status = "Model selection cancelled".into();
+                                app.status = "Ready".into();
                             }
                             _ => {}
                         }

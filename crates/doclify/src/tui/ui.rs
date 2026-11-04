@@ -39,7 +39,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     draw_conversation(frame, rows[1], app);
     draw_flow(frame, rows[2], app.snapshot.as_ref());
-    draw_input(frame, rows[3], &app.input, app.cursor, &app.status, app.busy);
+    draw_input(
+        frame,
+        rows[3],
+        &app.input,
+        app.cursor,
+        &app.status,
+        app.busy,
+    );
     if let Some(choices) = app.model_choices.as_ref() {
         draw_model_picker(frame, area, choices, app.model_selection);
     }
@@ -56,24 +63,24 @@ fn draw_header(
         Some(snapshot) => (
             snapshot.repository.as_str(),
             snapshot.branch.as_deref().unwrap_or("branch unknown"),
-            snapshot.model.as_deref().unwrap_or("model not configured"),
+            snapshot.model.as_deref().unwrap_or("no AI selected"),
             snapshot.registration == RegistrationState::Registered,
         ),
         None => (
-            "repository unavailable",
+            "project unavailable",
             "branch unknown",
-            "model not configured",
+            "no AI selected",
             false,
         ),
     };
     let state = if loading {
-        "SYNCING"
+        "LOADING"
     } else if error.is_some() {
-        "OFFLINE"
+        "STATUS ERROR"
     } else if registered {
-        "CONNECTED"
+        "READY"
     } else {
-        "NOT INITIALIZED"
+        "SETUP NEEDED"
     };
     let state_color = if registered {
         ACCENT
@@ -103,7 +110,7 @@ fn draw_header(
             ),
         ]),
         Line::from(vec![
-            Span::styled(" MODEL  ", Style::default().fg(MUTED)),
+            Span::styled(" AI  ", Style::default().fg(MUTED)),
             Span::styled(model, Style::default().fg(BLUE)),
         ]),
     ];
@@ -127,7 +134,7 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
         let (color, label) = if message.role == "you" {
             (BLUE, "YOU")
         } else {
-            (ACCENT, "DOC")
+            (ACCENT, "DOCLIFY")
         };
         lines.push(Line::from(Span::styled(
             format!("{label}  "),
@@ -144,7 +151,9 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let inner_height = area.height.saturating_sub(2) as usize;
     let max_scroll = wrapped_height.saturating_sub(inner_height);
-    let scroll = max_scroll.saturating_sub(app.conversation_from_bottom).min(u16::MAX as usize) as u16;
+    let scroll = max_scroll
+        .saturating_sub(app.conversation_from_bottom)
+        .min(u16::MAX as usize) as u16;
     let conversation = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
         .scroll((scroll, 0))
@@ -180,12 +189,12 @@ fn draw_flow(frame: &mut Frame, area: Rect, snapshot: Option<&WorkflowSnapshot>)
         .unwrap_or_else(|| ("?".into(), "?".into(), "?".into(), "?".into()));
     let flow = Line::from(vec![
         Span::styled(
-            format!(" CAPTURE  {capture} "),
+            format!(" IMPORT  {capture} "),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled("›", Style::default().fg(MUTED)),
         Span::styled(
-            format!(" PROPOSE  {propose} "),
+            format!(" DRAFTS  {propose} "),
             Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled("›", Style::default().fg(MUTED)),
@@ -237,14 +246,19 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &str, cursor: usize, status:
     if let Some(current) = after.chars().next() {
         input_spans.push(Span::styled(
             current.to_string(),
-            Style::default().fg(PANEL).bg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(PANEL)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
-        input_spans.push(Span::styled(&after[current.len_utf8()..], Style::default().fg(TEXT)));
+        input_spans.push(Span::styled(
+            &after[current.len_utf8()..],
+            Style::default().fg(TEXT),
+        ));
     } else {
         input_spans.push(Span::styled("▏", Style::default().fg(ACCENT)));
     }
-    let prompt = Paragraph::new(Line::from(input_spans))
-    .block(
+    let prompt = Paragraph::new(Line::from(input_spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT))
@@ -256,9 +270,12 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &str, cursor: usize, status:
     );
     frame.render_widget(prompt, chunks[0]);
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(if busy { "Working…" } else { status }, Style::default().fg(MUTED)),
         Span::styled(
-            "   ·   Enter send   ↑↓ history   PgUp/PgDn scroll   Ctrl-C quit   /help",
+            if busy { "Working…" } else { status },
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            " · Enter send · ↑↓ history · PgUp/Dn scroll · Ctrl-C exit · /help",
             Style::default().fg(Color::Rgb(103, 119, 141)),
         ),
     ]))
@@ -282,7 +299,10 @@ fn draw_model_picker(
                     choice.id.as_str(),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )),
-                Line::from(Span::styled(choice.status.as_str(), Style::default().fg(MUTED))),
+                Line::from(Span::styled(
+                    choice.status.as_str(),
+                    Style::default().fg(MUTED),
+                )),
             ])
         })
         .collect::<Vec<_>>();
@@ -291,7 +311,7 @@ fn draw_model_picker(
         .highlight_style(Style::default().bg(Color::Rgb(34, 46, 62)).fg(BLUE))
         .block(
             Block::default()
-                .title(" Choose a model · ↑/↓ move · Enter select · Esc cancel ")
+                .title(" Choose an AI · ↑/↓ move · Enter select · Esc cancel ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
                 .style(Style::default().bg(PANEL))
