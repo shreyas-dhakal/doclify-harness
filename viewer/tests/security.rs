@@ -292,44 +292,94 @@ async fn record_source_returns_exact_portable_version() {
     let store = doclify_domain::Store::open(tmp.path()).unwrap();
     let record: doclify_domain::Record = serde_json::from_value(serde_json::json!({"id":"decision-1","version":1,"kind":"decision","title":"Decision","statement":"Statement","rationale":"Reason","review":"proposed","implementation":"planned","experiment_outcome":null,"provenance":[{"source":"event:123","excerpt":"portable excerpt"}],"evidence":["event:123"],"supersedes":null})).unwrap();
     store.propose(&record).unwrap();
-    store.review("decision-1", 1, doclify_domain::ReviewState::Accepted).unwrap();
-    let app = Viewer::new(tmp.path()).unwrap().router("http://127.0.0.1:12345");
-    let req = |uri| Request::builder().uri(uri).header("host", "127.0.0.1:12345").body(Body::empty()).unwrap();
-    let response = app.clone().oneshot(req("/api/record-source?id=decision-1&version=1")).await.unwrap();
+    store
+        .review("decision-1", 1, doclify_domain::ReviewState::Accepted)
+        .unwrap();
+    let app = Viewer::new(tmp.path())
+        .unwrap()
+        .router("http://127.0.0.1:12345");
+    let req = |uri| {
+        Request::builder()
+            .uri(uri)
+            .header("host", "127.0.0.1:12345")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(req("/api/record-source?id=decision-1&version=1"))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
     let source: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(source["review"], "proposed");
     assert_eq!(source["provenance"][0]["excerpt"], "portable excerpt");
-    assert_eq!(app.oneshot(req("/api/record-source?id=..%2Fsecret&version=1")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        app.oneshot(req("/api/record-source?id=..%2Fsecret&version=1"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_regeneration_and_viewer_save_preserve_the_winner() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
-    assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(repo).status().unwrap().success());
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success());
     doclify_evidence::docs::generate(repo, None).unwrap();
     let path = repo.join("docs/doclify/overview.mdx");
     let old = std::fs::read_to_string(&path).unwrap();
-    let revision = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(old.as_bytes()));
+    let revision = format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(old.as_bytes())
+    );
     std::fs::write(repo.join("README.md"), "new file").unwrap();
-    assert!(std::process::Command::new("git").args(["add", "README.md"]).current_dir(repo).status().unwrap().success());
+    assert!(std::process::Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success());
     let lock = std::fs::File::open(repo.join("docs/doclify")).unwrap();
     lock.lock().unwrap();
     let generation_repo = repo.to_owned();
-    let generation = tokio::task::spawn_blocking(move || doclify_evidence::docs::generate(&generation_repo, None).unwrap());
+    let generation = tokio::task::spawn_blocking(move || {
+        doclify_evidence::docs::generate(&generation_repo, None).unwrap()
+    });
     let viewer = Viewer::new(repo).unwrap();
     let request = Request::builder().method("PUT").uri("/api/document").header("host", "127.0.0.1:12345").header("origin", "http://127.0.0.1:12345").header("x-doclify-token", viewer.token()).header("content-type", "application/json").body(Body::from(serde_json::json!({"path":"overview.mdx", "content":format!("{old}\nHuman change.\n"), "revision":revision}).to_string())).unwrap();
-    let saving = tokio::spawn(async move { viewer.router("http://127.0.0.1:12345").oneshot(request).await.unwrap() });
+    let saving = tokio::spawn(async move {
+        viewer
+            .router("http://127.0.0.1:12345")
+            .oneshot(request)
+            .await
+            .unwrap()
+    });
     drop(lock);
     let report = generation.await.unwrap();
     let response = saving.await.unwrap();
     let current = std::fs::read_to_string(path).unwrap();
     match response.status() {
-        StatusCode::OK => assert!(current.contains("Human change."), "successful save lost during regeneration: {report:?}"),
+        StatusCode::OK => assert!(
+            current.contains("Human change."),
+            "successful save lost during regeneration: {report:?}"
+        ),
         StatusCode::CONFLICT => {
-            let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
             let latest: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(latest["content"], current);
             assert!(!current.contains("Human change."));

@@ -316,13 +316,23 @@ async fn record_source(
     Query(q): Query<RecordSource>,
 ) -> Result<Json<doclify_domain::Record>, StatusCode> {
     if q.id.is_empty()
-        || !q.id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        || !q
+            .id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
         || q.version == 0
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let records = app.viewer.dir.open_dir(".doclify/records").map_err(|_| StatusCode::NOT_FOUND)?;
-    if !records.symlink_metadata(&q.id).is_ok_and(|m| m.file_type().is_dir()) {
+    let records = app
+        .viewer
+        .dir
+        .open_dir(".doclify/records")
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if !records
+        .symlink_metadata(&q.id)
+        .is_ok_and(|m| m.file_type().is_dir())
+    {
         return Err(StatusCode::NOT_FOUND);
     }
     let dir = records.open_dir(&q.id).map_err(|_| StatusCode::NOT_FOUND)?;
@@ -330,11 +340,18 @@ async fn record_source(
     if !dir.symlink_metadata(&name).is_ok_and(|m| m.is_file()) {
         return Err(StatusCode::NOT_FOUND);
     }
-    let text = dir.read_to_string(name).map_err(|_| StatusCode::NOT_FOUND)?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let text = dir
+        .read_to_string(name)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let record: doclify_domain::Record = serde_json::from_value(
-        value.get("record").cloned().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        value
+            .get("record")
+            .cloned()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if record.id != q.id || record.version != q.version {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }

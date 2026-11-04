@@ -85,7 +85,8 @@ pub fn build(worktree: &Path, scope: &Scope, limits: &Limits) -> io::Result<Opti
 
 /// Like `build`, over the union of several worktrees' records (e.g. a linked
 /// worktree, then the primary). An id held by more than one is taken from the
-/// copy with the highest latest version; ties go to the earlier worktree. If
+/// copy with the highest latest version, then a reviewed copy over an
+/// unreviewed one (a review is newer news); ties go to the earlier worktree. If
 /// any copy is unreadable the id is reported unreadable, not resolved silently.
 pub fn build_merged(
     worktrees: &[&Path],
@@ -122,12 +123,14 @@ pub fn build_merged(
                 let (store, history) = copies
                     .into_iter()
                     .rev()
-                    .max_by_key(|(_, h)| h.last().map(|r| r.version))
+                    .max_by_key(|(_, h)| {
+                        h.last()
+                            .map(|r| (r.version, r.review != ReviewState::Proposed))
+                    })
                     .expect("every id has an owner");
                 Ok((history, store.accepted(&id)?))
             });
         let (history, accepted) = match chosen {
-
             Ok(v) => v,
             Err(_) => {
                 unreadable.push(id);
@@ -292,6 +295,65 @@ pub fn build_merged(
     }))
 }
 
+/// Line starts that only Doclify's rendered context produces. The strip test
+/// renders a full context, so drift from the `format!`s above fails it.
+const RENDERED: [&str; 9] = [
+    "# Doclify project context",
+    "Generated locally from Doclify records",
+    "Rejected proposals and abandoned experiments are excluded.",
+    "## Accepted constraints",
+    "Explicitly accepted in Doclify review.",
+    "## Open work (not settled constraints)",
+    "For awareness only: unfinished or unreviewed.",
+    "Not shown (scope or size limit",
+    "Unreadable records (resolve",
+];
+
+/// Removes Doclify's injected context, and an agent's restatement of it, from
+/// captured text: rendered boilerplate, lines citing `[id@vN]`, and the
+/// `Statement:`/`Rationale:`/`Evidence:`/`Pending:` lines that follow them.
+/// Otherwise accepted constraints come back as fresh proposals.
+// ponytail: line heuristic; a quote that drops the `[id@vN]` citation survives.
+pub fn strip_quoted(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_item = false;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim().trim_start_matches(['-', '*', '>', ' ']);
+        if has_citation(line) {
+            in_item = true;
+        } else if in_item
+            && ["Statement:", "Rationale:", "Evidence:", "Pending:"]
+                .iter()
+                .any(|l| bare.trim_start_matches('*').starts_with(l))
+        {
+        } else if RENDERED.iter().any(|p| bare.starts_with(p)) {
+            in_item = false;
+        } else {
+            in_item = false;
+            out += line;
+        }
+    }
+    out
+}
+
+/// `[id@vN]`, as `constraint_text`/`open_text` cite records.
+fn has_citation(line: &str) -> bool {
+    line.split('[').skip(1).any(|rest| {
+        let Some((inner, _)) = rest.split_once(']') else {
+            return false;
+        };
+        let Some((id, version)) = inner.rsplit_once("@v") else {
+            return false;
+        };
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && !version.is_empty()
+            && version.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
 fn constraint(r: &Record, pending: Option<u64>, l: &Limits) -> Constraint {
     Constraint {
         id: r.id.clone(),
@@ -354,9 +416,12 @@ fn describe(scope: &Scope, ordered: bool) -> String {
         .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k} '{}'", clip(v, 80))))
         .collect();
     if scope.topic.is_none() {
-        let start = "No task or path scope is known, so this lists repository-wide constraints and pointers rather than guessing the task.";
+        let start = match &scope.branch {
+            Some(b) => format!("No task or path scope is known, so this lists repository-wide constraints, those scoped to branch '{}', and pointers rather than guessing the task.", clip(b, 80)),
+            None => "No task or path scope is known, so this lists repository-wide constraints and pointers rather than guessing the task.".into(),
+        };
         return if !ordered {
-            start.into()
+            start
         } else {
             format!("{start} Ordered by {}.", given.join(" and "))
         };
@@ -374,10 +439,6 @@ fn applicable(record: &Record, scope: &Scope) -> bool {
     if record_scope.branch.is_none() && record_scope.paths.is_empty() {
         return true;
     }
-    // A branch alone does not establish what task or paths are in scope.
-    let Some(topic) = scope.topic.as_deref() else {
-        return false;
-    };
     if record_scope
         .branch
         .as_ref()
@@ -386,6 +447,10 @@ fn applicable(record: &Record, scope: &Scope) -> bool {
         return false;
     }
     if !record_scope.paths.is_empty() {
+        // A branch alone does not establish what task or paths are in scope.
+        let Some(topic) = scope.topic.as_deref() else {
+            return false;
+        };
         let words = topic.split_whitespace().map(|w| {
             w.trim_matches(|c: char| {
                 !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'

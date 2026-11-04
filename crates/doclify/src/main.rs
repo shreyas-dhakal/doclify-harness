@@ -96,23 +96,16 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["init"] => {
-            let paths = install::install(&repo, "doclify")?;
-            Store::open(&repo.worktree)?;
-            let recovery = match recovery::install(&repo) {
-                Ok(value) => {
-                    let _ = fs::remove_file(repo.git_dir.join("doclify/recovery-error"));
-                    value
-                }
-                Err(e) => {
-                    let message = e.to_string();
-                    fs::write(repo.git_dir.join("doclify/recovery-error"), &message)?;
-                    json!({"active":false,"error":message})
-                }
-            };
-            Ok(
-                json!({"installed": paths, "recovery": recovery, "notice":"Codex requires project trust and hook approval."}),
-            )
+        ["init"] => initialize(&repo, None),
+        ["init", "--model", provider] if *provider == "claude" || *provider == "codex" => {
+            initialize(&repo, Some(json!({"provider":provider})))
+        }
+        ["init", "--model", provider, url, key_env, model]
+            if *provider == "openai" || *provider == "anthropic" =>
+        {
+            let selected = api_model_configuration(provider, url, key_env, model)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            initialize(&repo, Some(selected))
         }
         ["uninstall"] => {
             let removed = install::uninstall(&repo)?;
@@ -136,12 +129,15 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                     }
                 }
             }
+            let unsupported = queue.unsupported()?;
             let evidence = doclify_evidence::load(&repo.git_dir.join("doclify"))?;
             Ok(
                 json!({"registered": repo.registered(), "pending_events":count, "rejected_events":rejected_count(&repo.queue_dir())?,
                 "pending_extraction":queue.pending()?.len(), "rejected_details":rejected_events(&repo.queue_dir())?, "pending_review":pending,
+                "unsupported_transcript_count":unsupported.len(), "unsupported_transcripts":unsupported,
                 "github":evidence.map(|e| e.github), "selected_model":load_config(&repo)?, "background_error":fs::read_to_string(repo.git_dir.join("doclify/worker-error")).ok(),
-                "recovery_error":fs::read_to_string(repo.git_dir.join("doclify/recovery-error")).ok(), "codex_hook_approval":"not verified"}),
+                "recovery_error":fs::read_to_string(repo.git_dir.join("doclify/recovery-error")).ok(),
+                "codex_hook_approval":{"status":"not_observable","required":"trust the repository and approve project hooks in /hooks"}}),
             )
         }
         ["rejected"] => Ok(json!({"events": rejected_events(&repo.queue_dir())?})),
@@ -171,6 +167,21 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             fs::remove_file(path)?;
             Ok(json!({"replayed":id}))
         }
+        ["unsupported"] => {
+            let queue = Queue::open(repo.git_dir.join("doclify/jobs"))?;
+            let transcripts = queue.unsupported()?;
+            let count = transcripts.len();
+            Ok(json!({"transcripts":transcripts,"count":count}))
+        }
+        ["unsupported", "replay"] => {
+            let queue = Queue::open(repo.git_dir.join("doclify/jobs"))?;
+            let roots = session_roots();
+            let roots: Vec<_> = roots.iter().map(|(_, root)| root.as_path()).collect();
+            let replayed = queue.replay_unsupported(&roots)?;
+            let remaining = queue.unsupported()?;
+            let remaining_count = remaining.len();
+            Ok(json!({"replayed":replayed,"remaining":remaining,"remaining_count":remaining_count}))
+        }
         ["sync"] => {
             if repo.registered() {
                 fs::create_dir_all(repo.queue_dir())?;
@@ -184,13 +195,26 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 .iter()
                 .map(|(agent, root)| (agent.as_str(), root.as_path()))
                 .collect();
-            let drained = doclify_pipeline::reconcile_repository_locked(
+            let deferred_released = hook::release_deferred(&repo.queue_dir())?;
+            let reconciliation = doclify_pipeline::reconcile_repository_stats_locked(
                 &queue,
                 &repo.queue_dir(),
                 &repo.worktree,
                 &sessions,
             )?;
+            let drained = reconciliation.drained_events;
             let captured = captured_jobs(&local.join("jobs"))?;
+            let captured_sessions = captured_session_count(&captured);
+            let _ = doclify_capture::metrics::set_gauge(
+                &repo,
+                "last_sync_discovered_sessions",
+                reconciliation.discovered_sessions as u64,
+            );
+            let _ = doclify_capture::metrics::set_gauge(
+                &repo,
+                "last_sync_captured_sessions",
+                captured_sessions as u64,
+            );
             let evidence = doclify_evidence::sync(
                 &repo.worktree,
                 &local,
@@ -208,32 +232,34 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 )?),
                 None => None,
             };
+            // Product measurements are opt-in and must never make capture or
+            // documentation generation fail when the local metrics file is unavailable.
+            let _ = doclify_capture::metrics::increment(&repo, "captured_events", drained as u64);
+            let _ = doclify_capture::metrics::increment(
+                &repo,
+                "extracted_jobs",
+                processed.unwrap_or_default() as u64,
+            );
             let docs = doclify_evidence::docs::generate(&repo.worktree, Some(&evidence))?;
             Ok(
                 json!({"reconciled_events":drained, "rejected_events":rejected_count(&repo.queue_dir())?, "processed":processed, "pending_extraction":queue.pending()?.len(),
+                "deferred_released":deferred_released, "unsupported_transcript_count":queue.unsupported()?.len(),
                 "commits":evidence.commits.len(), "github":evidence.github, "links":evidence.links, "docs":docs}),
             )
         }
         ["model"] | ["model", "list"] => model_list(&repo),
+        ["metrics"] | ["metrics", "report"] => Ok(doclify_capture::metrics::report(&repo)?),
+        ["metrics", "enable"] => Ok(doclify_capture::metrics::set_enabled(&repo, true)?),
+        ["metrics", "disable"] => Ok(doclify_capture::metrics::set_enabled(&repo, false)?),
+        ["metrics", "repeated-explanation"] => {
+            doclify_capture::metrics::increment(&repo, "repeated_explanations", 1)?;
+            Ok(doclify_capture::metrics::report(&repo)?)
+        }
         ["model", "set", provider, url, key_env, model]
             if *provider == "openai" || *provider == "anthropic" =>
         {
-            if model.trim().is_empty() || key_env.trim().is_empty() {
-                return Err("model and credential environment variable are required".into());
-            }
-            let parsed = url::Url::parse(url).map_err(|_| "invalid provider URL")?;
-            if !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.query().is_some()
-                || parsed.fragment().is_some()
-                || !(parsed.scheme() == "https"
-                    || (parsed.scheme() == "http"
-                        && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))))
-            {
-                return Err("provider URL must use HTTPS or loopback HTTP and contain no credentials, query, or fragment".into());
-            }
-            let selected =
-                json!({"provider":provider,"base_url":url,"api_key_env":key_env,"model":model});
+            let selected = api_model_configuration(provider, url, key_env, model)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             save_config(&repo, &selected)?;
             Ok(json!({"selected":selected,"authentication":"unverified"}))
         }
@@ -248,7 +274,7 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 json!({"repository":repo.worktree,"registered":repo.registered(),
                 "hooks":{"claude":hook_status(&repo.worktree, Agent::Claude),
                          "codex":hook_status(&repo.worktree, Agent::Codex),
-                         "codex_approval":"unverified"},"models":models,
+                         "codex_approval":{"status":"not_observable","required":"trust the repository and approve project hooks in /hooks"}},"models":models,
                 "versions":{"claude":agent_version("claude"),"codex":agent_version("codex")}, "capture_compatibility":"unverified; transcript formats are checked during sync"}),
             )
         }
@@ -259,11 +285,11 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
                 "supersede" => ReviewState::Superseded,
                 _ => return Err("review action must be accept, reject, or supersede".into()),
             };
-            Ok(serde_json::to_value(Store::open(&repo.worktree)?.review(
-                id,
-                version.parse()?,
-                state,
-            )?)?)
+            let reviewed = Store::open(&repo.worktree)?.review(id, version.parse()?, state)?;
+            if matches!(state, ReviewState::Rejected | ReviewState::Superseded) {
+                let _ = doclify_capture::metrics::increment(&repo, "review_corrections", 1);
+            }
+            Ok(serde_json::to_value(reviewed)?)
         }
         ["handoff"] => handoff(&repo, None),
         ["handoff", topic @ ..] => handoff(&repo, Some(topic.join(" "))),
@@ -280,11 +306,69 @@ fn run(args: &[String]) -> Result<Value, Box<dyn std::error::Error>> {
             Ok(json!({"pending_review":pending}))
         }
         ["help"] => Ok(
-            json!({"commands":["init", "uninstall", "status", "sync", "doctor", "rejected [replay <id>]", "model [list|set claude|codex|set openai|anthropic <url> <key-env> <model>]", "review [<id> <version> <accept|reject|supersede>]", "docs", "handoff [topic]", "help", "quit"]}),
+            json!({"commands":["init [--model claude|codex|openai|anthropic <url> <key-env> <model>]", "uninstall", "status", "sync", "doctor", "rejected [replay <id>]", "unsupported [replay]", "metrics [enable|disable|report|repeated-explanation]", "model [list|set claude|codex|set openai|anthropic <url> <key-env> <model>]", "review [<id> <version> <accept|reject|supersede>]", "docs", "handoff [topic]", "help", "quit"]}),
         ),
         _ => Err("unknown command; run doclify help".into()),
     }
 }
+
+fn initialize(
+    repo: &RepoInfo,
+    selected_model: Option<Value>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let paths = install::install(repo, "doclify")?;
+    Store::open(&repo.worktree)?;
+    if let Some(model) = selected_model {
+        save_config(repo, &model)?;
+    }
+    let recovery = match recovery::install(repo) {
+        Ok(value) => {
+            let _ = fs::remove_file(repo.git_dir.join("doclify/recovery-error"));
+            value
+        }
+        Err(e) => {
+            let message = e.to_string();
+            fs::write(repo.git_dir.join("doclify/recovery-error"), &message)?;
+            json!({"active":false,"error":message})
+        }
+    };
+    let selected_model = load_config(repo)?;
+    let model_setup_required = selected_model.is_none();
+    Ok(json!({
+        "installed": paths,
+        "recovery": recovery,
+        "selected_model": selected_model,
+        "model_setup_required": model_setup_required,
+        "notice": "Codex requires project trust and hook approval."
+    }))
+}
+
+fn api_model_configuration(
+    provider: &str,
+    url: &str,
+    key_env: &str,
+    model: &str,
+) -> Result<Value, String> {
+    if model.trim().is_empty() || key_env.trim().is_empty() {
+        return Err("model and credential environment variable are required".into());
+    }
+    let parsed = url::Url::parse(url).map_err(|_| "invalid provider URL")?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !(parsed.scheme() == "https"
+            || (parsed.scheme() == "http"
+                && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))))
+    {
+        return Err(
+            "provider URL must use HTTPS or loopback HTTP and contain no credentials, query, or fragment"
+                .into(),
+        );
+    }
+    Ok(json!({"provider":provider,"base_url":url,"api_key_env":key_env,"model":model}))
+}
+
 fn ids(repo: &RepoInfo) -> io::Result<Vec<String>> {
     let path = repo.worktree.join(".doclify/records");
     if !path.exists() {
@@ -368,14 +452,17 @@ fn repl() -> ExitCode {
             continue;
         }
         if parts.len() == 1 && parts[0] == "model" {
-            match run(&parts) {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+            let catalog = match run(&parts) {
+                Ok(v) => {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                    v
+                }
                 Err(e) => {
                     eprintln!("doclify: {e}");
                     continue;
                 }
-            }
-            println!("Search models by name; enter a number or exact name to select, or blank to cancel. API models can be configured with /model set.");
+            };
+            println!("Search models by name; enter a number or exact name to select, or blank to cancel.");
             let repo = match std::env::current_dir()
                 .ok()
                 .and_then(|cwd| RepoInfo::discover(&cwd))
@@ -393,30 +480,51 @@ fn repl() -> ExitCode {
                     continue;
                 }
             };
-            let mut choices = vec!["claude".to_owned(), "codex".to_owned()];
-            if let Some(id) = config
+            let api_models = config
                 .as_ref()
-                .and_then(|c| c["model"].as_str())
-                .filter(|id| !id.is_empty())
-            {
-                choices.push(id.to_owned());
-            }
-            if let Some(ref config) = config {
-                if matches!(config["provider"].as_str(), Some("openai" | "anthropic")) {
-                    match doclify::repl::discover_models(config) {
-                        Ok(models) => choices.extend(models),
-                        Err(e) => eprintln!("doclify: model discovery failed: {e}"),
-                    }
-                }
-            }
-            choices.dedup();
+                .filter(|c| matches!(c["provider"].as_str(), Some("openai" | "anthropic")))
+                .map(|c| {
+                    let discovery = doclify::repl::discover_models(c).map_err(|e| {
+                        eprintln!("doclify: model discovery failed: {e}");
+                        e
+                    });
+                    doclify::repl::picker_models(Some(c), discovery)
+                })
+                .unwrap_or_default();
+            let mut choices = vec!["claude".to_owned(), "codex".to_owned()];
+            choices.extend(api_models.iter().map(|m| m.id.clone()));
             let mut shown = choices.clone();
             loop {
                 for (i, choice) in shown.iter().enumerate() {
                     let status = if choice == "claude" || choice == "codex" {
-                        "see bridge capability above; authentication unverified"
+                        let capability = &catalog["bridges"][choice]["capability"];
+                        if capability == "unavailable" {
+                            format!(
+                                "unavailable: {}",
+                                catalog["bridges"][choice]["reason"]
+                                    .as_str()
+                                    .unwrap_or("capability check failed")
+                            )
+                        } else {
+                            "available; authentication unverified".to_owned()
+                        }
                     } else {
-                        "API availability and authentication unverified"
+                        match api_models
+                            .iter()
+                            .find(|model| model.id == *choice)
+                            .map(|m| m.status)
+                        {
+                            Some(doclify::repl::ModelStatus::Discovered) => {
+                                "discovered; authentication unverified".to_owned()
+                            }
+                            Some(doclify::repl::ModelStatus::ConfiguredOnly) => {
+                                "not returned by discovery; availability unverified".to_owned()
+                            }
+                            Some(doclify::repl::ModelStatus::DiscoveryUnavailable) => {
+                                "discovery failed; configured availability unknown".to_owned()
+                            }
+                            None => "availability unverified".to_owned(),
+                        }
                     };
                     println!("{}: {} ({})", i + 1, choice, status);
                 }
@@ -578,11 +686,14 @@ fn handoff(repo: &RepoInfo, topic: Option<String>) -> Result<Value, Box<dyn std:
         branch: repo.branch.clone(),
         topic,
     };
-    Ok(serde_json::to_value(doclify_context::build(
-        &repo.worktree,
-        &scope,
-        &Default::default(),
-    )?)?)
+    let context = doclify_context::build(&repo.worktree, &scope, &Default::default())?;
+    if context
+        .as_ref()
+        .is_some_and(|c| !c.constraints.is_empty() || !c.open_work.is_empty())
+    {
+        let _ = doclify_capture::metrics::increment(repo, "handoff_deliveries", 1);
+    }
+    Ok(serde_json::to_value(context)?)
 }
 fn docs(background: bool) -> ExitCode {
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -630,7 +741,7 @@ fn hook_status(worktree: &std::path::Path, agent: Agent) -> Value {
     let parsed = fs::read(&path)
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()));
-    let events = ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop"];
+    let events = install::EVENTS;
     let missing: Vec<_> = events
         .into_iter()
         .filter(|event| {
@@ -790,6 +901,21 @@ fn captured_jobs(root: &std::path::Path) -> io::Result<Vec<Value>> {
     Ok(jobs)
 }
 
+fn captured_session_count(jobs: &[Value]) -> usize {
+    let sessions: std::collections::HashSet<_> = jobs
+        .iter()
+        .filter_map(|job| {
+            let event = job.get("event").unwrap_or(job);
+            let agent = job["agent"].as_str().or_else(|| event["agent"].as_str())?;
+            let session = job["session_id"]
+                .as_str()
+                .or_else(|| event["payload"]["session_id"].as_str())?;
+            Some((agent.to_owned(), session.to_owned()))
+        })
+        .collect();
+    sessions.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,6 +957,9 @@ mod audit_tests {
         fs::write(&path, "{}").unwrap();
         let status = hook_status(dir.path(), Agent::Claude);
         assert_eq!(status["installed"], false);
-        assert_eq!(status["missing_events"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            status["missing_events"].as_array().unwrap().len(),
+            install::EVENTS.len()
+        );
     }
 }

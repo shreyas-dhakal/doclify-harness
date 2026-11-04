@@ -82,6 +82,25 @@ fn migrates_legacy_bare_records_and_rejects_future_schemas() {
 }
 
 #[test]
+fn reads_pre_experiment_outcome_records_with_unknown_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join(".doclify/records/guest-checkout");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut old = serde_json::to_value(proposal()).unwrap();
+    old.as_object_mut().unwrap().remove("experiment_outcome");
+    std::fs::write(
+        folder.join("00000000000000000001.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    let history = store.history("guest-checkout").unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].experiment_outcome, None);
+}
+
+#[test]
 fn fixture_keeps_requirement_decision_and_abandoned_experiment_distinct() {
     let store = Store::open(concat!(
         env!("CARGO_MANIFEST_DIR"),

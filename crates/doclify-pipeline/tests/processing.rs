@@ -200,6 +200,36 @@ fn discovery_only_reconciles_sessions_owned_by_repository() {
 }
 
 #[test]
+fn repository_reconciliation_reports_drained_events_and_discovered_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let sessions = dir.path().join("sessions");
+    let hooks = dir.path().join("hooks");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&hooks).unwrap();
+    let meta = serde_json::json!({"type":"session_meta","payload":{"id":"s1","cwd":repo}});
+    let user = serde_json::json!({"type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"requirement"}]}});
+    std::fs::write(sessions.join("s1.jsonl"), format!("{meta}\n{user}\n")).unwrap();
+    std::fs::write(
+        hooks.join("event.json"),
+        serde_json::to_vec(&serde_json::json!({"agent":"claude","payload":{"prompt":"decision"}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let queue = Queue::open(dir.path().join("queue")).unwrap();
+    let stats = doclify_pipeline::reconcile_repository_stats_locked(
+        &queue,
+        &hooks,
+        &repo,
+        &[("codex", sessions.as_path())],
+    )
+    .unwrap();
+    assert_eq!(stats.drained_events, 1);
+    assert_eq!(stats.discovered_sessions, 1);
+}
+
+#[test]
 fn background_worker_processes_queued_events() {
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
@@ -522,6 +552,60 @@ fn extracted_experiment_outcome_is_preserved() {
         store.history(&format!("capture-{id}-0")).unwrap()[0].experiment_outcome,
         Some(doclify_domain::ExperimentOutcome::Abandoned)
     );
+}
+
+#[test]
+fn extracted_experiment_lifecycle_controls_directive_context() {
+    struct Experiment(&'static str);
+    impl Extractor for Experiment {
+        fn extract(&mut self, event: &Value) -> io::Result<Value> {
+            Ok(
+                serde_json::json!({"proposals":[{"kind":"experiment","summary":format!("{} experiment", self.0),"review":"proposed","evidence":[event["source_id"]],"experiment_outcome":self.0}]}),
+            )
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let queue = Queue::open(dir.path().join("q")).unwrap();
+    let store = doclify_domain::Store::open(dir.path()).unwrap();
+    let output = dir.path().join("out");
+    for (outcome, prompt) in [
+        ("active", "Start experiment"),
+        ("completed", "Finish experiment"),
+        ("abandoned", "Abandon experiment"),
+    ] {
+        queue
+            .reconcile(&serde_json::json!({"agent":"codex","payload":{"prompt":prompt}}))
+            .unwrap();
+        let event_id = queue.pending().unwrap()[0].0.clone();
+        doclify_pipeline::process_proposals(&queue, &output, &store, &mut Experiment(outcome))
+            .unwrap();
+        store
+            .review(
+                &format!("capture-{event_id}-0"),
+                1,
+                doclify_domain::ReviewState::Accepted,
+            )
+            .unwrap();
+    }
+
+    let context = doclify_context::build(
+        dir.path(),
+        &doclify_context::Scope::default(),
+        &doclify_context::Limits::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(context.open_work.len(), 1);
+    assert_eq!(
+        context.open_work[0].status,
+        "experiment, active; not a decision"
+    );
+    assert!(context.render().contains("active experiment"));
+    assert!(!context
+        .open_work
+        .iter()
+        .any(|item| item.title.contains("completed") || item.title.contains("abandoned")));
 }
 
 /// Claude Code 2.1.308 opens transcripts with cwd-less `queue-operation` lines;

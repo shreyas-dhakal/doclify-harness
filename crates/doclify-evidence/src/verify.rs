@@ -4,7 +4,10 @@
 use crate::{mentions, Basis, Commit};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::{BTreeMap, HashMap}, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,12 +54,31 @@ pub struct SessionLink {
 
 // ponytail: fixed list of test runners; make configurable if repos use custom scripts.
 const RUNNERS: [&str; 16] = [
-    "cargo test", "cargo nextest", "npm test", "npm run test", "pnpm test", "pnpm run test",
-    "yarn test", "bun test", "pytest", "go test", "make test", "vitest", "jest", "rspec",
-    "mvn test", "gradle test",
+    "cargo test",
+    "cargo nextest",
+    "npm test",
+    "npm run test",
+    "pnpm test",
+    "pnpm run test",
+    "yarn test",
+    "bun test",
+    "pytest",
+    "go test",
+    "make test",
+    "vitest",
+    "jest",
+    "rspec",
+    "mvn test",
+    "gradle test",
 ];
-const CLAIMS: [&str; 6] =
-    ["tests pass", "tests passed", "tests are passing", "tests now pass", "test suite passes", "all green"];
+const CLAIMS: [&str; 6] = [
+    "tests pass",
+    "tests passed",
+    "tests are passing",
+    "tests now pass",
+    "test suite passes",
+    "all green",
+];
 const MAX_SCOPE: usize = 300;
 
 /// `(envelope, transcript)` where the envelope is the capture hook event.
@@ -75,7 +97,9 @@ fn session_of<'a>(env: &'a Value, job: Option<&'a Value>) -> &'a str {
 
 pub fn test_runs(captured: &[Value]) -> Vec<TestRun> {
     let mut runs: Vec<TestRun> = captured.iter().filter_map(test_run).collect();
-    runs.sort_by(|a, b| (a.observed_at_ms, &a.session, &a.scope).cmp(&(b.observed_at_ms, &b.session, &b.scope)));
+    runs.sort_by(|a, b| {
+        (a.observed_at_ms, &a.session, &a.scope).cmp(&(b.observed_at_ms, &b.session, &b.scope))
+    });
     runs.dedup();
     runs
 }
@@ -98,16 +122,26 @@ fn test_run(v: &Value) -> Option<TestRun> {
             if !event.starts_with("PostToolUse") {
                 return None;
             }
-            let command = match &p["tool_input"]["command"] {
+            // Codex's `exec_command` names it `cmd`.
+            let input = &p["tool_input"];
+            let command = match input.get("command").unwrap_or(&input["cmd"]) {
                 Value::String(s) => s.clone(),
-                Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 _ => return None,
             };
             let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
             if !RUNNERS.iter().any(|r| mentions(&normalized, r)) {
                 return None;
             }
-            (TestSource::Observed, outcome(env["agent"].as_str(), event, &p["tool_response"]), clip(&normalized))
+            (
+                TestSource::Observed,
+                outcome(env["agent"].as_str(), event, &p["tool_response"]),
+                clip(&normalized),
+            )
         }
     };
     Some(TestRun {
@@ -127,11 +161,31 @@ fn outcome(agent: Option<&str>, event: &str, response: &Value) -> TestOutcome {
     let code = ["exit_code", "exitCode"]
         .iter()
         .find_map(|k| response[k].as_i64())
-        .or_else(|| response.as_str()?.strip_prefix("Exit code: ")?.lines().next()?.trim().parse().ok());
+        .or_else(|| {
+            response
+                .as_str()?
+                .strip_prefix("Exit code: ")?
+                .lines()
+                .next()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        // Codex `exec_command` output: "...\nProcess exited with code N\n...".
+        .or_else(|| {
+            response.as_str()?.lines().find_map(|l| {
+                l.strip_prefix("Process exited with code ")?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+        });
     match code {
         Some(0) => TestOutcome::Passed,
         Some(_) => TestOutcome::Failed,
-        None if event == "PostToolUseFailure" || response["interrupted"] == true => TestOutcome::Failed,
+        None if event == "PostToolUseFailure" || response["interrupted"] == true => {
+            TestOutcome::Failed
+        }
         // Claude Code fires PostToolUse only for commands that succeeded.
         None if agent == Some("claude") && event == "PostToolUse" => TestOutcome::Passed,
         None => TestOutcome::Unknown,
@@ -147,7 +201,9 @@ fn clip(s: &str) -> String {
 /// The sentence around a claim, so the scope is what the agent actually said.
 fn excerpt(text: &str, at: usize) -> String {
     let start = text[..at].rfind(['.', '\n', '!', '?']).map_or(0, |i| i + 1);
-    let end = text[at..].find(['.', '\n', '!', '?']).map_or(text.len(), |i| at + i);
+    let end = text[at..]
+        .find(['.', '\n', '!', '?'])
+        .map_or(text.len(), |i| at + i);
     clip(text[start..end].trim())
 }
 
@@ -178,16 +234,42 @@ pub fn mark_stale(repo: &Path, head: Option<&str>, runs: &mut [TestRun]) {
     }
 }
 fn worktree_dirty(repo: &Path) -> Option<bool> {
-    let out = std::process::Command::new("git").current_dir(repo)
-        .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify", ":(exclude).claude/settings.local.json", ":(exclude).codex/hooks.json"])
-        .output().ok()?;
-    out.status.success().then(|| !out.stdout.is_empty())
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude)docs/doclify",
+            ":(exclude).doclify",
+            ":(exclude).claude/settings.local.json",
+            ":(exclude).codex/hooks.json",
+        ])
+        .output()
+        .ok()?;
+    out.status.success().then_some(!out.stdout.is_empty())
 }
 fn changed_since(repo: &Path, rev: &str, head: &str) -> Option<String> {
     if rev.starts_with('-') {
         return Some("invalid revision".into());
     }
-    match crate::git(repo, &["diff", "--name-only", rev, head, "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify", ":(exclude).claude/settings.local.json", ":(exclude).codex/hooks.json"]) {
+    match crate::git(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            rev,
+            head,
+            "--",
+            ".",
+            ":(exclude)docs/doclify",
+            ":(exclude).doclify",
+            ":(exclude).claude/settings.local.json",
+            ":(exclude).codex/hooks.json",
+        ],
+    ) {
         Err(_) => Some(format!("revision {} not found locally", short(rev))),
         Ok(out) => match out.lines().count() {
             0 => None,
@@ -211,10 +293,16 @@ pub fn sessions(captured: &[Value], commits: &[Commit]) -> Vec<SessionLink> {
         if session == "unknown" {
             continue;
         }
-        let key = (env["agent"].as_str().unwrap_or("unknown").to_owned(), session.to_owned());
+        let key = (
+            env["agent"].as_str().unwrap_or("unknown").to_owned(),
+            session.to_owned(),
+        );
         let heads = seen.entry(key).or_default();
         if let Some(head) = env["head"].as_str() {
-            heads.push((env["received_at_ms"].as_u64().unwrap_or_default(), head.into()));
+            heads.push((
+                env["received_at_ms"].as_u64().unwrap_or_default(),
+                head.into(),
+            ));
         }
     }
     let mut links = Vec::new();
@@ -231,7 +319,10 @@ pub fn sessions(captured: &[Value], commits: &[Commit]) -> Vec<SessionLink> {
             if mentions(&c.subject, &session) || mentions(&c.body, &session) {
                 links.push(link(Basis::Direct, "commit message cites session"));
             } else if heads.windows(2).any(|w| w[0].1 != c.sha && w[1].1 == c.sha) {
-                links.push(link(Basis::Suggested, "HEAD moved to this commit during session"));
+                links.push(link(
+                    Basis::Suggested,
+                    "HEAD moved to this commit during session",
+                ));
             }
         }
     }

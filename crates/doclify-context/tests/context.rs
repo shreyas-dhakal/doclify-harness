@@ -182,7 +182,9 @@ fn limits_bound_output_and_leave_pointers() {
         .iter()
         .all(|c| c.rationale.chars().count() <= limits.max_field_chars + 1));
     assert_eq!(ctx.constraints.len() + ctx.omitted.len(), 40);
-    assert!(ctx.render().contains("Not shown (scope or size limit; inspect records before relying on them): decision-"));
+    assert!(ctx.render().contains(
+        "Not shown (scope or size limit; inspect records before relying on them): decision-"
+    ));
     assert!(ctx.render().contains("more"));
 }
 
@@ -424,5 +426,111 @@ fn scoped_constraints_require_known_matching_task_and_branch() {
         );
         assert_eq!(context.omitted.contains(&"scoped".to_string()), !expected);
     }
+}
 
+/// At startup only the branch is known: repository-wide and matching
+/// branch-scoped records apply; path-scoped and other-branch records become
+/// pointers, and an unknown branch matches no branch scope.
+#[test]
+fn startup_uses_branch_scope_but_never_guesses_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let scoped = |id: &str, branch: Option<&str>, paths: &[&str]| {
+        let mut r = record(id, RecordKind::Decision, id);
+        r.scope = Some(RecordScope {
+            branch: branch.map(str::to_owned),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        });
+        r
+    };
+    for r in [
+        record("repo-unscoped", RecordKind::Decision, "Repository rule"),
+        scoped("repo-empty-scope", None, &[]),
+        scoped("branch-a", Some("feature/a"), &[]),
+        scoped("paths-only", None, &["src/auth"]),
+    ] {
+        accept(&store, &r);
+    }
+    let ids = |branch: Option<&str>| {
+        let ctx = build(
+            dir.path(),
+            &Scope {
+                branch: branch.map(str::to_owned),
+                topic: None,
+            },
+            &Limits::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut shown: Vec<_> = ctx.constraints.iter().map(|c| c.id.clone()).collect();
+        shown.sort();
+        let mut omitted = ctx.omitted.clone();
+        omitted.sort();
+        (shown, omitted, ctx.render().to_owned())
+    };
+    let (shown, omitted, text) = ids(Some("feature/a"));
+    assert_eq!(shown, ["branch-a", "repo-empty-scope", "repo-unscoped"]);
+    assert_eq!(omitted, ["paths-only"]);
+    assert!(text.contains("branch 'feature/a'"), "{text}");
+    for branch in [Some("feature/b"), None] {
+        let (shown, omitted, _) = ids(branch);
+        assert_eq!(shown, ["repo-empty-scope", "repo-unscoped"], "{branch:?}");
+        assert_eq!(omitted, ["branch-a", "paths-only"], "{branch:?}");
+    }
+}
+
+/// A linked worktree whose unreviewed v2 revision collides with the primary's
+/// v2 acceptance must not hide that acceptance.
+#[test]
+fn merged_reviewed_copy_beats_unreviewed_copy_of_same_version() {
+    let (local, primary) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (l, p) = (
+        Store::open(local.path()).unwrap(),
+        Store::open(primary.path()).unwrap(),
+    );
+    let shared = record("decision-shared", RecordKind::Decision, "Shared rule");
+    l.propose(&shared).unwrap();
+    let mut revision = shared.clone();
+    revision.version = 2;
+    revision.title = "Local revision".into();
+    l.propose(&revision).unwrap();
+    accept(&p, &shared);
+    l.propose(&record("task-local", RecordKind::Task, "Local proposal"))
+        .unwrap();
+    accept(
+        &l,
+        &record("decision-local", RecordKind::Decision, "Local rule"),
+    );
+    let ctx = build_merged(
+        &[local.path(), primary.path()],
+        &Scope::default(),
+        &Limits::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut constraints: Vec<_> = ctx.constraints.iter().map(|c| c.id.as_str()).collect();
+    constraints.sort();
+    assert_eq!(constraints, ["decision-local", "decision-shared"]);
+    let open: Vec<_> = ctx.open_work.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(open, ["task-local"]);
+}
+
+/// Text an agent echoes back from Doclify's injected context must not be
+/// re-extracted as new claims; everything else survives.
+#[test]
+fn quoted_context_is_stripped_but_other_text_survives() {
+    let dir = guest_checkout();
+    let ctx = build(dir.path(), &Scope::default(), &Limits::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(doclify_context::strip_quoted(ctx.render()).trim(), "");
+    let reply = "Here is the context:\n\
+                 - **[decision-guest-checkout@v2]** Allow guest checkout\n\
+                 \x20 Rationale: Customers abandon account creation.\n\
+                 \x20 Evidence: event:abc\n\
+                 We should also add receipt emails.\n";
+    assert_eq!(
+        doclify_context::strip_quoted(reply),
+        "Here is the context:\nWe should also add receipt emails.\n"
+    );
 }

@@ -20,7 +20,7 @@ In the repository you want to document:
 ```sh
 cd /path/to/your/repository
 doclify init
-doclify model set claude
+doclify init --model claude
 doclify doctor
 ```
 
@@ -28,7 +28,7 @@ doclify doctor
 
 ```sh
 export OPENAI_API_KEY='your-key'
-doclify model set openai https://api.openai.com/v1 OPENAI_API_KEY your-model-id
+doclify init --model openai https://api.openai.com/v1 OPENAI_API_KEY your-model-id
 ```
 
 ## Use
@@ -38,11 +38,23 @@ Run `doclify` for the interactive prompt, or use the commands directly:
 ```sh
 doclify sync                    # capture sessions and update documentation
 doclify status                  # inspect capture and review queues
+doclify unsupported             # inspect unsupported transcript details
+doclify unsupported replay      # retry them after an adapter or transcript update
 doclify review                  # list proposals
 doclify review <id> <version> accept
 doclify handoff "authentication" # get reviewed context for another session
 doclify docs                    # open the local viewer and editor
+doclify metrics report          # inspect opt-in, local product measurements
 ```
+
+Product measurements are disabled by default. Run `doclify metrics enable` to
+count captured events, extracted jobs, rejected or superseded review proposals,
+generated handoffs, and user-reported repeated explanations. The report also
+shows last-sync capture coverage (sessions with captured content divided by
+sessions discovered). Report a repeated explanation with
+`doclify metrics repeated-explanation`. Data stays in the Git directory at
+`.git/doclify/metrics.json`, is excluded from Git, and is never uploaded.
+Disable collection with `doclify metrics disable`.
 
 In the prompt, use `/model`, `/sync`, `/review`, `/handoff`, `/docs`, `/status`, and `/quit`. Generated documentation is stored in `docs/doclify/`; reviewed records are stored in `.doclify/records/`. Share them through your normal Git workflow.
 

@@ -7,6 +7,7 @@ use std::process::Command;
 
 pub mod hook;
 pub mod install;
+pub mod metrics;
 pub mod transcript;
 
 /// Set by Doclify on every model-bridge subprocess (`codex exec`, `claude -p`).

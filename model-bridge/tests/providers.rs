@@ -15,6 +15,14 @@ fn accepts_only_cited_proposals() {
     assert_eq!(result.proposals.len(), 1);
 }
 
+#[test]
+fn rejects_unknown_experiment_outcomes_and_outcomes_on_other_kinds() {
+    let unknown = r#"{"proposals":[{"kind":"experiment","summary":"Try bypass","review":"proposed","evidence":["event:1"],"experiment_outcome":"paused"}]}"#;
+    let wrong_kind = r#"{"proposals":[{"kind":"decision","summary":"Allow bypass","review":"proposed","evidence":["event:1"],"experiment_outcome":"active"}]}"#;
+    assert!(validate_proposals(unknown).is_err());
+    assert!(validate_proposals(wrong_kind).is_err());
+}
+
 fn server(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -14,6 +14,13 @@ use crate::{Agent, RepoInfo, BRIDGE_ENV};
 pub const SCHEMA: u64 = 1;
 // ponytail: hard cap on hook payload; raise if real payloads get truncated.
 const MAX_PAYLOAD: u64 = 16 << 20;
+/// Hooks whose transcript cannot be attributed yet wait here, under the queue.
+pub const DEFERRED: &str = "deferred";
+// ponytail: transcript prefix scanned for attribution; past it the worker decides.
+const ATTRIBUTION_SCAN: u64 = 1 << 20;
+/// Deferred hooks still unattributable after this go to the worker anyway, so
+/// its rejection makes them visible instead of hiding them forever.
+const MAX_DEFERRAL_MS: u128 = 24 * 60 * 60 * 1000;
 
 /// Reads the hook payload from stdin and enqueues it. Errors are swallowed by
 /// the caller; this returns them only so tests can see what happened.
@@ -81,6 +88,7 @@ pub fn session_context(raw: &[u8], fallback_cwd: &Path) -> Option<String> {
         .flatten()
         .collect();
     let context = doclify_context::build_merged(&worktrees, &scope, &Default::default()).ok()??;
+    let _ = crate::metrics::increment(&repo, "handoff_deliveries", 1);
     let out = json!({
         "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context.render() }
     });
@@ -124,6 +132,14 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
         std::process::id(),
         agent.name()
     );
+    // Claude's first hooks fire before its transcript names a `cwd`, so the
+    // worker cannot verify ownership yet and would reject them.
+    let dir = if attributable(agent, &event["payload"]) {
+        dir
+    } else {
+        dir.join(DEFERRED)
+    };
+    fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("{name}.tmp"));
     let path = dir.join(format!("{name}.json"));
     let mut options = fs::OpenOptions::new();
@@ -137,7 +153,71 @@ pub fn enqueue(agent: Agent, raw: &[u8], fallback_cwd: &Path) -> io::Result<Opti
         .open(&tmp)?
         .write_all(&serde_json::to_vec(&event)?)?;
     fs::rename(&tmp, &path)?;
+    let _ = release_deferred(&repo.queue_dir());
     Ok(Some(path))
+}
+
+/// Whether the worker can attribute this hook's transcript: Codex starts
+/// with `session_meta`, Claude needs some line carrying `cwd`. Only a missing
+/// transcript, or one of valid JSON lines that has not named its owner yet,
+/// is unattributable; anything else (including non-transcripts) goes to the
+/// worker, whose ownership check rejects it visibly.
+fn attributable(agent: Agent, payload: &Value) -> bool {
+    let Some(path) = payload["transcript_path"].as_str() else {
+        return true;
+    };
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(ATTRIBUTION_SCAN + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
+    }
+    if bytes.len() as u64 > ATTRIBUTION_SCAN {
+        return true;
+    }
+    // The trailing segment may still be being written.
+    let complete = &bytes[..bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1)];
+    let Ok(lines) = complete
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(serde_json::from_slice::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return true;
+    };
+    match agent {
+        Agent::Codex => lines.first().is_some_and(|v| v["type"] == "session_meta"),
+        Agent::Claude => lines.iter().any(|v| v["cwd"].is_string()),
+    }
+}
+
+/// Moves deferred hooks back into the queue once attributable (or too old to
+/// wait), keeping their time-sorted names so the worker sees arrival order.
+/// Runs on every enqueue, so a session's next hook releases its earlier ones.
+pub fn release_deferred(queue_dir: &Path) -> io::Result<usize> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut released = 0;
+    let deferred = match pending(&queue_dir.join(DEFERRED)) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        deferred => deferred?,
+    };
+    for (path, event) in deferred {
+        let agent = event["agent"].as_str().and_then(Agent::parse);
+        let age = now.saturating_sub(event["received_at_ms"].as_u64().unwrap_or(0).into());
+        if age > MAX_DEFERRAL_MS || agent.is_none_or(|a| attributable(a, &event["payload"])) {
+            fs::rename(&path, queue_dir.join(path.file_name().unwrap()))?;
+            released += 1;
+        }
+    }
+    Ok(released)
 }
 
 /// Queued events in arrival order. The worker deletes each file only after it
@@ -163,7 +243,18 @@ pub fn pending(queue_dir: &Path) -> io::Result<Vec<(PathBuf, Value)>> {
 pub fn worktree_dirty(repo: &Path) -> Option<bool> {
     let out = std::process::Command::new("git")
         .current_dir(repo)
-        .args(["status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)docs/doclify", ":(exclude).doclify", ":(exclude).claude/settings.local.json", ":(exclude).codex/hooks.json"])
-        .output().ok()?;
-    out.status.success().then(|| !out.stdout.is_empty())
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude)docs/doclify",
+            ":(exclude).doclify",
+            ":(exclude).claude/settings.local.json",
+            ":(exclude).codex/hooks.json",
+        ])
+        .output()
+        .ok()?;
+    out.status.success().then_some(!out.stdout.is_empty())
 }

@@ -124,7 +124,13 @@ pub struct SyncOptions<'a> {
 }
 impl Default for SyncOptions<'_> {
     fn default() -> Self {
-        Self { max_commits: 500, max_pull_requests: 100, gh: Some("gh"), gh_timeout: Duration::from_secs(30), captured: &[] }
+        Self {
+            max_commits: 500,
+            max_pull_requests: 100,
+            gh: Some("gh"),
+            gh_timeout: Duration::from_secs(30),
+            captured: &[],
+        }
     }
 }
 pub const MAX_GH_OUTPUT: usize = 32 << 20;
@@ -139,16 +145,30 @@ pub fn sync(repo: &Path, local_dir: &Path, options: &SyncOptions) -> io::Result<
         .ok()
         .map(|s| s.trim().to_owned());
     let branches = branches(repo)?;
-    let commits = if branches.is_empty() { vec![] } else { commits(repo, options.max_commits)? };
+    let commits = if branches.is_empty() {
+        vec![]
+    } else {
+        commits(repo, options.max_commits)?
+    };
     let github = match options.gh {
         Some(gh) => pull_requests(repo, gh, options.max_pull_requests, options.gh_timeout),
-        None => Github::Unavailable { reason: "GitHub sync disabled".into() },
+        None => Github::Unavailable {
+            reason: "GitHub sync disabled".into(),
+        },
     };
     let links = link(&records, &commits, &github);
     let mut tests = verify::test_runs(options.captured);
     verify::mark_stale(repo, head.as_deref(), &mut tests);
     let sessions = verify::sessions(options.captured, &commits);
-    let evidence = Evidence { head, branches, commits, github, links, tests, sessions };
+    let evidence = Evidence {
+        head,
+        branches,
+        commits,
+        github,
+        links,
+        tests,
+        sessions,
+    };
     fs::create_dir_all(local_dir)?;
     write_atomic(
         &local_dir.join("evidence.json"),
@@ -181,11 +201,21 @@ pub fn load_records(repo: &Path) -> io::Result<Vec<Vec<Record>>> {
 }
 
 pub fn branches(repo: &Path) -> io::Result<Vec<Branch>> {
-    Ok(git(repo, &["for-each-ref", "--format=%(refname:short)%1f%(objectname)", "refs/heads"])?
-        .lines()
-        .filter_map(|l| l.split_once('\x1f'))
-        .map(|(name, head)| Branch { name: name.into(), head: head.into() })
-        .collect())
+    Ok(git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%1f%(objectname)",
+            "refs/heads",
+        ],
+    )?
+    .lines()
+    .filter_map(|l| l.split_once('\x1f'))
+    .map(|(name, head)| Branch {
+        name: name.into(),
+        head: head.into(),
+    })
+    .collect())
 }
 
 pub fn commits(repo: &Path, max: usize) -> io::Result<Vec<Commit>> {
@@ -213,7 +243,11 @@ fn parse_commit(chunk: &str) -> Option<Commit> {
         .filter_map(|l| {
             let mut p = l.splitn(3, '\t');
             let (a, r, path) = (p.next()?, p.next()?, p.next()?);
-            Some(FileChange { path: path.into(), added: a.parse().ok(), removed: r.parse().ok() })
+            Some(FileChange {
+                path: path.into(),
+                added: a.parse().ok(),
+                removed: r.parse().ok(),
+            })
         })
         .collect();
     Some(Commit {
@@ -265,7 +299,14 @@ fn pull_requests(repo: &Path, gh: &str, max: usize, timeout: Duration) -> Github
     };
     if !ok {
         let stderr = String::from_utf8_lossy(&stderr);
-        return unavailable(stderr.lines().next().unwrap_or("gh failed").trim().to_owned());
+        return unavailable(
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("gh failed")
+                .trim()
+                .to_owned(),
+        );
     }
     let prs: Vec<serde_json::Value> = match serde_json::from_slice(&stdout) {
         Ok(v) => v,
@@ -273,7 +314,13 @@ fn pull_requests(repo: &Path, gh: &str, max: usize, timeout: Duration) -> Github
     };
     let s = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_owned();
     let opt = |v: &serde_json::Value| v.as_str().filter(|m| !m.is_empty()).map(String::from);
-    let clip = |v: &serde_json::Value| v.as_str().unwrap_or_default().chars().take(MAX_DISCUSSION).collect::<String>();
+    let clip = |v: &serde_json::Value| {
+        v.as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(MAX_DISCUSSION)
+            .collect::<String>()
+    };
     let pull_requests = prs
         .iter()
         .map(|p| PullRequest {
@@ -304,7 +351,11 @@ fn pull_requests(repo: &Path, gh: &str, max: usize, timeout: Duration) -> Github
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|c| Comment { author: s(&c["author"], "login"), body: clip(&c["body"]), created_at: opt(&c["createdAt"]) })
+                .map(|c| Comment {
+                    author: s(&c["author"], "login"),
+                    body: clip(&c["body"]),
+                    created_at: opt(&c["createdAt"]),
+                })
                 .collect(),
         })
         .collect();
@@ -320,24 +371,56 @@ pub fn link(records: &[Vec<Record>], commits: &[Commit], github: &Github) -> Vec
     };
     let mut links = Vec::new();
     for history in records {
-        let Some(id) = history.first().map(|r| r.id.as_str()) else { continue };
-        let cited: Vec<&str> = history.iter().flat_map(|r| &r.evidence).map(String::as_str).collect();
+        let Some(id) = history.first().map(|r| r.id.as_str()) else {
+            continue;
+        };
+        let cited: Vec<&str> = history
+            .iter()
+            .flat_map(|r| &r.evidence)
+            .map(String::as_str)
+            .collect();
         for c in commits {
             let direct = cited.iter().any(|e| {
-                e.strip_prefix("commit:").is_some_and(|p| p.len() >= 7 && c.sha.starts_with(p))
+                e.strip_prefix("commit:")
+                    .is_some_and(|p| p.len() >= 7 && c.sha.starts_with(p))
             });
             if direct {
-                links.push(Link { record: id.into(), target: format!("commit:{}", c.sha), basis: Basis::Direct, reason: "cited by record".into() });
+                links.push(Link {
+                    record: id.into(),
+                    target: format!("commit:{}", c.sha),
+                    basis: Basis::Direct,
+                    reason: "cited by record".into(),
+                });
             } else if mentions(&c.subject, id) || mentions(&c.body, id) {
-                links.push(Link { record: id.into(), target: format!("commit:{}", c.sha), basis: Basis::Suggested, reason: "commit message mentions record id".into() });
+                links.push(Link {
+                    record: id.into(),
+                    target: format!("commit:{}", c.sha),
+                    basis: Basis::Suggested,
+                    reason: "commit message mentions record id".into(),
+                });
             }
         }
         for p in prs {
             let target = format!("pr:{}", p.number);
             if cited.contains(&target.as_str()) {
-                links.push(Link { record: id.into(), target, basis: Basis::Direct, reason: "cited by record".into() });
-            } else if [&p.title, &p.body, &p.head].into_iter().chain(p.comments.iter().map(|c| &c.body)).chain(p.reviews.iter().map(|r| &r.body)).any(|t| mentions(t, id)) {
-                links.push(Link { record: id.into(), target, basis: Basis::Suggested, reason: "pull request mentions record id".into() });
+                links.push(Link {
+                    record: id.into(),
+                    target,
+                    basis: Basis::Direct,
+                    reason: "cited by record".into(),
+                });
+            } else if [&p.title, &p.body, &p.head]
+                .into_iter()
+                .chain(p.comments.iter().map(|c| &c.body))
+                .chain(p.reviews.iter().map(|r| &r.body))
+                .any(|t| mentions(t, id))
+            {
+                links.push(Link {
+                    record: id.into(),
+                    target,
+                    basis: Basis::Suggested,
+                    reason: "pull request mentions record id".into(),
+                });
             }
         }
     }
@@ -386,16 +469,30 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Ve
             Err(e) => return Err(e.to_string()),
         }
     };
-    let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100));
-    let out = stdout.recv_timeout(left).map_err(|_| "output did not close".to_owned())?;
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(100));
+    let out = stdout
+        .recv_timeout(left)
+        .map_err(|_| "output did not close".to_owned())?;
     if out.len() > MAX_GH_OUTPUT {
         return Err(format!("output exceeded {MAX_GH_OUTPUT} bytes"));
     }
-    Ok((status.success(), out, stderr.recv_timeout(Duration::from_millis(100)).unwrap_or_default()))
+    Ok((
+        status.success(),
+        out,
+        stderr
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default(),
+    ))
 }
 
 fn git(repo: &Path, args: &[&str]) -> io::Result<String> {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "git {}: {}",
@@ -408,7 +505,8 @@ fn git(repo: &Path, args: &[&str]) -> io::Result<String> {
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut temp = PathBuf::from(path);
-    temp.as_mut_os_string().push(format!(".{}.tmp", std::process::id()));
+    temp.as_mut_os_string()
+        .push(format!(".{}.tmp", std::process::id()));
     fs::write(&temp, bytes)?;
     fs::rename(&temp, path)
 }

@@ -170,4 +170,4 @@ At planning time the repository was empty except for `.git`. Available local too
 
 ## Current implementation checkpoint
 
-The workspace now contains the CLI, capture, domain, pipeline, evidence, context, model bridge, and viewer crates. Consult the README and crate documentation for current setup and limitations. The original acceptance criteria above remain targets; synthetic tests do not establish live agent compatibility or the complete guest-checkout handover.
+The implementation requirements above are complete in the current workspace. The CLI, capture, domain, pipeline, evidence, context, model bridge, SQLite search, and viewer slices are implemented, including the acceptance and recovery paths listed above. See [the implementation audit](docs/plan-audit-2026-11-03.md) for the requirement mapping, verification commands, authenticated guest-checkout result, and environment limits. Codex inference remains disabled until a tool-free execution mode can be verified; do not treat that safety restriction as available functionality.

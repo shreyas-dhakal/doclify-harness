@@ -91,6 +91,29 @@ fn init_installs_hooks_and_status_reports_queue() {
 }
 
 #[test]
+fn init_can_select_a_documentation_model_in_one_setup_command() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    let out = run(dir.path(), &["init", "--model", "claude"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["selected_model"]["provider"], "claude");
+    assert_eq!(result["model_setup_required"], false);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".git/doclify/model.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["provider"], "claude");
+}
+
+#[test]
 fn hook_is_silent_and_fail_open_without_a_repository() {
     let dir = tempfile::tempdir().unwrap();
     let output = run(dir.path(), &["hook", "codex"]);
@@ -163,6 +186,52 @@ fn repl_accepts_model_picker_and_exit() {
 }
 
 #[test]
+fn repl_labels_saved_model_when_provider_discovery_fails() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(run(
+        dir.path(),
+        &[
+            "model",
+            "set",
+            "openai",
+            "http://127.0.0.1:9/v1",
+            "MISSING_TEST_KEY",
+            "saved-model"
+        ]
+    )
+    .status
+    .success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_doclify"))
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/model\n\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let output = String::from_utf8_lossy(&out.stdout);
+    assert!(output.contains("saved-model"), "{output}");
+    assert!(
+        output.contains("discovery failed; configured availability unknown"),
+        "{output}"
+    );
+}
+
+#[test]
 fn model_configuration_rejects_credentials_in_url() {
     let dir = tempfile::tempdir().unwrap();
     Command::new("git")
@@ -204,6 +273,71 @@ fn status_before_init_reports_unregistered() {
 }
 
 #[test]
+fn local_metrics_are_opt_in_and_count_user_reported_repetition() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+
+    let report = run(dir.path(), &["metrics", "report"]);
+    assert!(report.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["enabled"], false);
+    assert_eq!(report["counts"]["repeated_explanations"], 0);
+
+    assert!(run(dir.path(), &["metrics", "enable"]).status.success());
+    let record = |id: &str| Record {
+        id: id.into(),
+        version: 1,
+        kind: RecordKind::Decision,
+        title: id.into(),
+        statement: format!("The {id} decision"),
+        rationale: "Reduce repeated explanation".into(),
+        review: ReviewState::Proposed,
+        implementation: ImplementationState::Unknown,
+        experiment_outcome: None,
+        provenance: vec![Provenance {
+            source: "test".into(),
+            excerpt: None,
+        }],
+        evidence: vec![],
+        supersedes: None,
+        scope: None,
+        session: None,
+    };
+    let store = Store::open(dir.path()).unwrap();
+    store.propose(&record("accepted")).unwrap();
+    store.propose(&record("rejected")).unwrap();
+    assert!(run(dir.path(), &["review", "accepted", "1", "accept"])
+        .status
+        .success());
+    assert!(run(dir.path(), &["review", "rejected", "1", "reject"])
+        .status
+        .success());
+    assert!(run(dir.path(), &["handoff"]).status.success());
+    assert!(run(dir.path(), &["metrics", "repeated-explanation"])
+        .status
+        .success());
+    let report = run(dir.path(), &["metrics", "report"]);
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["enabled"], true);
+    assert_eq!(report["counts"]["review_corrections"], 1);
+    assert_eq!(report["counts"]["handoff_deliveries"], 1);
+    assert_eq!(report["counts"]["repeated_explanations"], 1);
+
+    assert!(run(dir.path(), &["metrics", "disable"]).status.success());
+    assert!(run(dir.path(), &["metrics", "repeated-explanation"])
+        .status
+        .success());
+    let report = run(dir.path(), &["metrics", "report"]);
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["enabled"], false);
+    assert_eq!(report["counts"]["repeated_explanations"], 1);
+}
+
+#[test]
 fn sync_rejects_untrusted_transcript_path_without_removing_hook() {
     use std::io::Write;
     use std::process::Stdio;
@@ -237,6 +371,61 @@ fn sync_rejects_untrusted_transcript_path_without_removing_hook() {
             .count(),
         1
     );
+}
+
+#[test]
+fn status_exposes_unsupported_transcripts_and_cli_replays_after_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(run(dir.path(), &["init"]).status.success());
+    let repo = doclify_capture::RepoInfo::discover(dir.path()).unwrap();
+    let home = repo.git_dir.join("test-home");
+    let root = home.join(".claude/projects/project");
+    fs::create_dir_all(&root).unwrap();
+    let transcript = root.join("session.jsonl");
+    let supported =
+        "{\"type\":\"user\",\"uuid\":\"1\",\"message\":{\"content\":\"allow guest checkout\"}}\n";
+    fs::write(
+        &transcript,
+        format!("{{\"type\":\"brand-new\"}}\n{supported}"),
+    )
+    .unwrap();
+    let queue = doclify_capture::queue::Queue::open(repo.git_dir.join("doclify/jobs")).unwrap();
+    let event = serde_json::json!({
+        "agent":"claude",
+        "payload":{"session_id":"session","transcript_path":transcript}
+    });
+    queue
+        .reconcile_with_roots(&event, &[root.as_path()])
+        .unwrap();
+    let status = run(dir.path(), &["status"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["unsupported_transcript_count"], 1);
+    assert!(status["unsupported_transcripts"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("brand-new"));
+
+    fs::write(
+        &transcript,
+        format!("{{\"type\":\"assistant\",\"uuid\":\"0\",\"message\":{{\"content\":\"done\"}}}}\n{supported}"),
+    )
+    .unwrap();
+    let replay = run(dir.path(), &["unsupported", "replay"]);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["replayed"], 1);
+    let status = run(dir.path(), &["status"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["unsupported_transcript_count"], 0);
 }
 
 #[test]
@@ -749,7 +938,7 @@ fn picker_keeps_configured_model_when_discovery_fails() {
     let output = child.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
-        text.contains("offline-model (API availability and authentication unverified)"),
+        text.contains("offline-model (discovery failed; configured availability unknown)"),
         "{text}"
     );
     assert!(text.contains("\"capability\": \"unavailable\""));

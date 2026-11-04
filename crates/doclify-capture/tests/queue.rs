@@ -16,21 +16,80 @@ fn reconciliation_replays_partial_and_changed_transcripts_without_duplicates() {
     queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
     assert_eq!(queue.pending().unwrap().len(), 2);
 }
+/// Unsupported lines no longer strand the valid entries after them: those are
+/// queued, the rest is recorded with an actionable reason, and replay re-reads
+/// the session from its stored event once the adapter or file is fixed.
 #[test]
-fn unsupported_transcript_stays_pending_until_corrected() {
+fn unsupported_lines_are_reported_and_recoverable_by_replay() {
     let root = tempfile::tempdir().unwrap();
     let transcript = root.path().join("session.jsonl");
     let queue = Queue::open(root.path().join("local")).unwrap();
-    let event = json!({"agent":"codex","payload":{"session_id":"s","transcript_path":transcript}});
-    fs::write(&transcript, "{\"type\":\"new-format\"}\n").unwrap();
-    assert!(queue.reconcile_with_roots(&event, &[root.path()]).is_err());
+    let event = json!({"agent":"claude","payload":{"session_id":"s","transcript_path":transcript}});
+    let valid =
+        "{\"type\":\"user\",\"uuid\":\"1\",\"message\":{\"content\":\"allow guest checkout\"}}\n";
+    fs::write(&transcript, format!("{{\"type\":\"brand-new\"}}\n{valid}")).unwrap();
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    assert_eq!(
+        queue.pending().unwrap().len(),
+        1,
+        "valid entry after unsupported line"
+    );
+    let reports = queue.unsupported().unwrap();
+    assert_eq!(reports.len(), 1);
+    let reason = reports[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("claude brand-new") && reason.contains("offset 0"),
+        "{reason}"
+    );
+    assert!(reason.contains("replay"), "{reason}");
+    assert_eq!(reports[0]["event"], event);
+
+    // Unchanged input: still reported, nothing duplicated.
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    assert_eq!(queue.replay_unsupported(&[root.path()]).unwrap(), 0);
+    assert_eq!(queue.pending().unwrap().len(), 1);
+    assert_eq!(queue.unsupported().unwrap().len(), 1);
+
+    // Once the line is understood, replay recovers it and clears the report.
     fs::write(
         &transcript,
-        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s\"}}\n",
+        format!(
+            "{{\"type\":\"assistant\",\"uuid\":\"0\",\"message\":{{\"content\":\"ok\"}}}}\n{valid}"
+        ),
     )
     .unwrap();
+    assert_eq!(queue.replay_unsupported(&[root.path()]).unwrap(), 1);
+    assert_eq!(queue.pending().unwrap().len(), 2);
+    assert!(queue.unsupported().unwrap().is_empty());
+}
+
+/// A report written by an older adapter is re-read from the start, so an
+/// upgrade recovers lines the checkpoint had already skipped.
+#[test]
+fn adapter_upgrade_rereads_previously_unsupported_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let transcript = root.path().join("session.jsonl");
+    let queue = Queue::open(root.path().join("local")).unwrap();
+    let event = json!({"agent":"claude","payload":{"session_id":"s","transcript_path":transcript}});
+    fs::write(&transcript, "{\"type\":\"brand-new\"}\n").unwrap();
     queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
-    assert_eq!(queue.pending().unwrap().len(), 1);
+    let report = fs::read_dir(root.path().join("local/unsupported"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    stored["format"] = json!("claude-session/0.0");
+    fs::write(&report, serde_json::to_vec(&stored).unwrap()).unwrap();
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    let again: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(
+        again["format"],
+        doclify_capture::transcript::CLAUDE_FORMAT,
+        "re-read from 0"
+    );
 }
 
 #[test]
@@ -158,4 +217,113 @@ fn transcript_jobs_carry_hook_metadata_not_its_prompt() {
             "{job}"
         );
     }
+}
+
+/// Codex subagent rollouts and Claude sidechain entries carry their parent
+/// session, and the parent survives incremental reads past the metadata line.
+#[test]
+fn child_sessions_carry_parent_session_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let queue = Queue::open(root.path().join("local")).unwrap();
+    let rollout = root.path().join("child.jsonl");
+    fs::write(&rollout, concat!(
+        r#"{"ordinal":0,"type":"session_meta","payload":{"id":"child","cwd":"/r","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}}}}"#, "\n",
+    )).unwrap();
+    let event = json!({"agent":"codex","payload":{"session_id":"child","transcript_path":rollout}});
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    let mut f = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+    std::io::Write::write_all(&mut f, concat!(r#"{"ordinal":1,"type":"response_item","payload":{"type":"message","id":"m1","role":"user","content":[{"type":"input_text","text":"later"}]}}"#, "\n").as_bytes()).unwrap();
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    let jobs = queue.pending().unwrap();
+    assert_eq!(jobs.len(), 2);
+    for (_, job) in &jobs {
+        assert_eq!(
+            job["context"]["payload"]["parent_session_id"], "parent",
+            "{job}"
+        );
+    }
+
+    let side = root.path().join("agent-a1.jsonl");
+    fs::write(&side, concat!(
+        r#"{"type":"user","uuid":"c1","isSidechain":true,"agentId":"a1","sessionId":"parent","cwd":"/r","message":{"content":"subtask"}}"#, "\n",
+    )).unwrap();
+    let event = json!({"agent":"claude","payload":{"session_id":"parent","transcript_path":side}});
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    let job = queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .map(|(_, j)| j)
+        .find(|j| j["agent"] == "claude")
+        .unwrap();
+    assert_eq!(job["session_id"], "a1");
+    assert_eq!(job["context"]["payload"]["parent_session_id"], "parent");
+}
+
+/// Doclify's own startup context, and an agent quoting it back, never become
+/// extraction input; new content in the same message still does.
+#[test]
+fn injected_context_is_not_recaptured() {
+    let root = tempfile::tempdir().unwrap();
+    let queue = Queue::open(root.path().join("local")).unwrap();
+    let transcript = root.path().join("session.jsonl");
+    let line = |uuid: &str, kind: &str, text: &str| {
+        format!(
+            "{}\n",
+            json!({"type":kind,"uuid":uuid,"message":{"content":text}})
+        )
+    };
+    fs::write(&transcript, [
+        line("1", "user", "# Doclify project context\nGenerated locally from Doclify records (no model call).\n\n## Accepted constraints\n- [decision-guest@v2] (decision, implementation planned) Allow guest checkout\n  Rationale: Customers abandon account creation.\n"),
+        line("2", "assistant", "Constraints:\n- [decision-guest@v2] Allow guest checkout\n  Rationale: Customers abandon account creation.\nNext I will add receipt emails."),
+    ].concat()).unwrap();
+    let event = json!({"agent":"claude","payload":{"session_id":"s","transcript_path":transcript}});
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    let texts: Vec<String> = queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .map(|(_, j)| j["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(texts, ["Constraints:\nNext I will add receipt emails."]);
+}
+
+/// A session recorded at this path before the repository existed (a deleted
+/// repository whose cwd was reused) is not imported; a current one is.
+#[test]
+fn sessions_predating_the_repository_are_not_imported() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    let queue = Queue::open(root.path().join("local")).unwrap();
+    let transcript = root.path().join("old.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"uuid\":\"1\",\"message\":{\"content\":\"old project\"}}\n",
+    )
+    .unwrap();
+    let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(day_ago)
+        .unwrap();
+    let event = json!({"agent":"claude","worktree":repo,"payload":{"session_id":"s","transcript_path":transcript}});
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    assert!(queue.pending().unwrap().is_empty());
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+    queue.reconcile_with_roots(&event, &[root.path()]).unwrap();
+    assert_eq!(queue.pending().unwrap().len(), 1);
 }

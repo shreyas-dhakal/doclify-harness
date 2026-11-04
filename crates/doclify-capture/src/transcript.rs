@@ -40,7 +40,8 @@ pub struct ReadResult {
     pub entries: Vec<Entry>,
     /// Byte offset to resume from. Never points inside a line.
     pub next_offset: u64,
-    /// Line types not understood by this adapter version, and unparseable lines.
+    /// Line types not understood by this adapter version, and unparseable
+    /// lines, each with its byte offset.
     pub unsupported: Vec<String>,
 }
 
@@ -75,16 +76,19 @@ pub fn read_from(agent: Agent, mut file: impl Read + Seek, offset: u64) -> io::R
         let line_offset = out.next_offset;
         out.next_offset += n as u64;
         let before = out.entries.len();
-        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
-            out.unsupported.push("unparseable line".into());
-            continue;
-        };
-        match agent {
-            Agent::Codex => codex(v, &mut out),
-            Agent::Claude => claude(v, &mut out),
+        let unsupported = out.unsupported.len();
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(v) => match agent {
+                Agent::Codex => codex(v, &mut out),
+                Agent::Claude => claude(v, &mut out),
+            },
+            Err(_) => out.unsupported.push("unparseable line".into()),
         }
         for entry in &mut out.entries[before..] {
             entry.offset = line_offset;
+        }
+        for line in &mut out.unsupported[unsupported..] {
+            *line += &format!(" at offset {line_offset}");
         }
     }
     Ok(out)
@@ -268,7 +272,7 @@ mod tests {
         assert_eq!(r.entries[1].text, "allow guest checkout");
         assert_eq!(r.entries[1].id.as_deref(), Some("m1"));
         assert_eq!(r.entries[0].id.as_deref(), Some("s1"));
-        assert_eq!(r.unsupported, ["codex brand_new/"]);
+        assert_eq!(r.unsupported, ["codex brand_new/ at offset 471"]);
 
         fs::OpenOptions::new()
             .append(true)
@@ -335,7 +339,7 @@ mod tests {
                 ("a2".into(), Kind::Assistant, "done".into()),
             ]
         );
-        assert_eq!(r.unsupported, ["unparseable line"]);
+        assert_eq!(r.unsupported, ["unparseable line at offset 493"]);
         fs::remove_file(p).unwrap();
     }
 

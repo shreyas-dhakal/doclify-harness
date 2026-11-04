@@ -7,6 +7,62 @@ use doclify_model_bridge::{
 use serde_json::Value;
 use std::time::Duration;
 
+/// Availability information for the API model catalog shown by the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelStatus {
+    Discovered,
+    ConfiguredOnly,
+    DiscoveryUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerModel {
+    pub id: String,
+    pub status: ModelStatus,
+}
+
+/// Build picker choices without dropping the saved model when the provider is
+/// offline. Discovery failure describes the catalog request, not the saved
+/// model's actual availability.
+pub fn picker_models(
+    config: Option<&Value>,
+    discovery: Result<Vec<String>, String>,
+) -> Vec<PickerModel> {
+    let configured = config
+        .and_then(|c| c.get("model"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty());
+    let mut models = Vec::new();
+    match discovery {
+        Ok(ids) => {
+            for id in ids {
+                if models.iter().any(|m: &PickerModel| m.id == id) {
+                    continue;
+                }
+                models.push(PickerModel {
+                    id,
+                    status: ModelStatus::Discovered,
+                });
+            }
+            if let Some(id) = configured.filter(|id| !models.iter().any(|m| m.id == *id)) {
+                models.push(PickerModel {
+                    id: id.into(),
+                    status: ModelStatus::ConfiguredOnly,
+                });
+            }
+        }
+        Err(_) => {
+            if let Some(id) = configured {
+                models.push(PickerModel {
+                    id: id.into(),
+                    status: ModelStatus::DiscoveryUnavailable,
+                });
+            }
+        }
+    }
+    models
+}
+
 fn field<'a>(config: &'a Value, name: &str) -> Result<&'a str, String> {
     config
         .get(name)

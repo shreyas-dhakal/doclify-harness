@@ -13,3 +13,4 @@ tokio = { version = "1", features = ["rt", "time", "process"] }
 
 [dev-dependencies]
 tempfile = "3"
+doclify-context = { path = "../doclify-context" }

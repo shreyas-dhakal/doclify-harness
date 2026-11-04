@@ -495,20 +495,37 @@ pub fn run_once(
     process_proposals_locked(queue, output, store, extractor)
 }
 
-/// Reconcile hooks and discover sessions while holding the queue lock.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileStats {
+    pub drained_events: usize,
+    pub discovered_sessions: usize,
+}
+
+/// Backward-compatible count of drained hook events.
 pub fn reconcile_repository_locked(
     queue: &Queue,
     hook_dir: &Path,
     repository: &Path,
     sessions: &[(&str, &Path)],
 ) -> io::Result<usize> {
+    Ok(reconcile_repository_stats_locked(queue, hook_dir, repository, sessions)?.drained_events)
+}
+
+/// Reconcile hooks and discover sessions while holding the queue lock, with
+/// counts for local capture coverage measurements.
+pub fn reconcile_repository_stats_locked(
+    queue: &Queue,
+    hook_dir: &Path,
+    repository: &Path,
+    sessions: &[(&str, &Path)],
+) -> io::Result<ReconcileStats> {
     let repository = repository.canonicalize()?;
     let mut paths = fs::read_dir(hook_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
     paths.retain(|p| p.extension().is_some_and(|ext| ext == "json"));
     paths.sort();
-    let mut drained = 0;
+    let mut stats = ReconcileStats::default();
     for path in paths {
         let result = (|| -> io::Result<()> {
             let event: Value = serde_json::from_slice(&fs::read(&path)?)
@@ -563,7 +580,7 @@ pub fn reconcile_repository_locked(
         match result {
             Ok(()) => {
                 fs::remove_file(&path)?;
-                drained += 1;
+                stats.drained_events += 1;
             }
             Err(e)
                 if matches!(
@@ -590,9 +607,9 @@ pub fn reconcile_repository_locked(
         fs::File::open(hook_dir)?.sync_all()?;
     }
     for (agent, root) in sessions {
-        discover_sessions(queue, &repository, agent, root)?;
+        stats.discovered_sessions += discover_sessions(queue, &repository, agent, root)?;
     }
-    Ok(drained)
+    Ok(stats)
 }
 
 /// Owns a background worker; stopping wakes it and waits for its current iteration.

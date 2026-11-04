@@ -1,5 +1,7 @@
 # Doclify plan audit — 2026-11-03
 
+> **Superseded status (2026-11-04):** the unchecked findings below describe the audited `83b746f` baseline. They are historical, not the current task list. The implementation follow-up and current verification are recorded at the end of this file.
+
 Audited checkout `83b746f` (already an ancestor of HEAD; no cherry-pick). Scope: all substantive requirements in `plan.md`, source and existing tests; static evidence is distinguished from live verification. P0 blocks the motivating acceptance scenario or trust; P1 is significant completeness/correctness; P2 is polish/measurement. File:line references are relative to repository root.
 
 ## Prioritized actionable checklist
@@ -53,3 +55,20 @@ Status: **partial** means implementation exists but acceptance or essential case
 ## Checks
 
  `cargo test --workspace --no-fail-fast` failed one target: `repl_request_persists_proposal_for_explicit_review` hit `WouldBlock` reading its fake server socket (`crates/doclify/tests/cli.rs:552`); the exact test passed on isolated rerun. All other targets passed, including five synthetic E2E tests and viewer security tests; the release asset test and real-transcript test were ignored. Frontend dependencies were not installed, so frontend tests were not run. Authenticated live tests were not run. This report is static audit evidence, not a claim of complete live compatibility.
+
+## Implementation completion — 2026-11-04
+
+The baseline implementation findings are closed in the current workspace:
+
+- Extraction proposes versioned changes against existing records; history preserves accepted versions and supports explicit accept, reject, supersede, and reversion flows. Shared record context merges linked worktree stores deterministically.
+- Capture registers lifecycle and tool hooks, retains raw tool results for evidence, tracks dirty-tree freshness, defers unattributable early hooks, filters quoted Doclify context, suppresses sessions predating the repository, and exposes unsupported transcripts with reasons and replay.
+- Experiment outcomes, scope, branch/path applicability, and parent-session attribution flow through extraction, storage, and startup context.
+- Hook installation validates configuration and rolls back partial changes. Doctor reports observable hook state and marks Codex project trust as not observable by the CLI.
+- Model selection retains saved IDs during discovery failures and labels capability/authentication status. `init --model` configures a model in one setup command.
+- Provenance is portable through record IDs and excerpts; the viewer links citations to records. Generator and editor writes synchronize to preserve concurrent prose edits.
+- Local opt-in metrics cover capture coverage, review corrections, handover delivery, and user-reported repeated explanations. Documentation search uses the rebuildable SQLite index.
+- `doclify docs --json` emits a JSON URL before opening the local viewer; setup and recovery commands are documented.
+
+Current verification: `cargo test --workspace --no-fail-fast -- --test-threads=1` (green; the default parallel test run has intermittent local fake-server contention), `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `npm test --prefix viewer/web` (3 unit tests and 8 browser tests), and `cargo test --release -p doclify --test e2e release_binary_embeds_viewer_assets -- --include-ignored --exact` (green). The recorded authenticated guest-checkout run verified Codex capture, explicit review, Claude startup handover, and transcript capture for codex-cli 0.166.0 and Claude Code 2.1.308.
+
+Codex inference remains deliberately disabled because its available execution mode cannot verify tool-free restrictions. The live result is specific to the recorded CLI versions and macOS; Linux release verification and repeat authenticated compatibility checks require those environments and account access. The live run also observed overlapping proposals from separate transcript items; session-level batching remains a product-quality improvement, not a blocker in the plan's stated acceptance criteria. These limits require external validation or product research and are not unfinished implementation checklist items.

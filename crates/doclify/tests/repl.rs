@@ -1,4 +1,4 @@
-use doclify::repl::{filter_models, request};
+use doclify::repl::{filter_models, picker_models, request, ModelStatus};
 use serde_json::json;
 
 #[test]
@@ -7,6 +7,15 @@ fn model_search_is_case_insensitive_and_returns_provider_names() {
         filter_models(&["alpha".into(), "Beta-2".into()], "ETA"),
         vec!["Beta-2"]
     );
+}
+
+#[test]
+fn picker_retains_configured_model_and_marks_failed_discovery_unavailable() {
+    let config = json!({"provider":"openai", "model":"configured-model"});
+    let models = picker_models(Some(&config), Err("connection refused".into()));
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "configured-model");
+    assert_eq!(models[0].status, ModelStatus::DiscoveryUnavailable);
 }
 
 #[test]

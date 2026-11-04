@@ -278,7 +278,12 @@ fn tool_hook_captures_dirty_worktree_state() {
     let info = RepoInfo::discover(&dir).unwrap();
     doclify_capture::install::install(&info, "doclify-capture").unwrap();
     fs::write(dir.join("changed.rs"), "changed").unwrap();
-    run_hook(&dir, "claude", r#"{"hook_event_name":"PostToolUse","tool_input":{"command":"cargo test"}}"#, &[]);
+    run_hook(
+        &dir,
+        "claude",
+        r#"{"hook_event_name":"PostToolUse","tool_input":{"command":"cargo test"}}"#,
+        &[],
+    );
     let events = hook::pending(&info.queue_dir()).unwrap();
     assert_eq!(events[0].1["worktree_dirty"], true);
 }
@@ -397,5 +402,230 @@ fn unregistered_repo_worktrees_get_no_hooks() {
     assert!(out.status.success() && out.stdout.is_empty());
     assert!(!wt.join(".claude").exists() && !dir.join(".claude").exists());
     fs::remove_dir_all(&wt).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Claude fires SessionStart/UserPromptSubmit before its transcript has a
+/// `cwd` line, so ownership cannot be checked yet. Those hooks wait in
+/// `deferred/` and rejoin the queue, in order, once the transcript attributes.
+#[test]
+fn early_unattributable_events_are_deferred_then_released_in_order() {
+    let dir = git_repo("deferred");
+    let info = RepoInfo::discover(&dir).unwrap();
+    doclify_capture::install::install(&info, "doclify-capture").unwrap();
+    let transcript = dir.with_extension("transcript.jsonl");
+    let _ = fs::remove_file(&transcript);
+    let hook_payload = |event: &str| {
+        format!(
+            r#"{{"hook_event_name":"{event}","session_id":"s","cwd":"{}","transcript_path":"{}"}}"#,
+            dir.display(),
+            transcript.display()
+        )
+    };
+    // Not yet created, then only a cwd-less queue operation.
+    run_hook(&dir, "claude", &hook_payload("SessionStart"), &[]);
+    fs::write(&transcript, "{\"type\":\"queue-operation\"}\n").unwrap();
+    run_hook(&dir, "claude", &hook_payload("UserPromptSubmit"), &[]);
+    assert_eq!(queued(&dir), 0);
+    let deferred = info.queue_dir().join("deferred");
+    assert_eq!(fs::read_dir(&deferred).unwrap().count(), 2);
+
+    fs::write(
+        &transcript,
+        format!(
+            "{{\"type\":\"queue-operation\"}}\n{{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"{}\"}}\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    run_hook(&dir, "claude", &hook_payload("Stop"), &[]);
+    let events: Vec<String> = hook::pending(&info.queue_dir())
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e["payload"]["hook_event_name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(events, ["SessionStart", "UserPromptSubmit", "Stop"]);
+    assert_eq!(fs::read_dir(&deferred).unwrap().count(), 0);
+    fs::remove_file(transcript).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A linked worktree with its own reviewed and unreviewed records still gets
+/// every applicable primary constraint, and a primary acceptance wins over a
+/// stale local proposal of the same version.
+#[test]
+fn linked_worktree_merges_local_and_primary_records() {
+    use doclify_domain::*;
+    let record = |id: &str, kind: RecordKind| Record {
+        id: id.into(),
+        version: 1,
+        kind,
+        title: id.into(),
+        statement: id.into(),
+        rationale: "Because.".into(),
+        review: ReviewState::Proposed,
+        implementation: ImplementationState::Planned,
+        experiment_outcome: None,
+        provenance: vec![],
+        evidence: vec![],
+        supersedes: None,
+        scope: None,
+        session: None,
+    };
+    let dir = git_repo("mixed");
+    git(&dir, &["commit", "--allow-empty", "-qm", "initial"]);
+    let info = RepoInfo::discover(&dir).unwrap();
+    doclify_capture::install::install(&info, "doclify-capture").unwrap();
+    let wt = dir.with_extension("mixed-linked");
+    let _ = fs::remove_dir_all(&wt);
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "mixed-linked",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let (primary, local) = (Store::open(&dir).unwrap(), Store::open(&wt).unwrap());
+    for (store, r, accept) in [
+        (
+            &primary,
+            record("decision-primary", RecordKind::Decision),
+            true,
+        ),
+        (
+            &primary,
+            record("decision-shared", RecordKind::Decision),
+            true,
+        ),
+        (
+            &local,
+            record("decision-shared", RecordKind::Decision),
+            false,
+        ),
+        (
+            &local,
+            Record {
+                version: 2,
+                ..record("decision-shared", RecordKind::Decision)
+            },
+            false,
+        ),
+        (&local, record("decision-local", RecordKind::Decision), true),
+        (
+            &local,
+            record("task-local-proposal", RecordKind::Task),
+            false,
+        ),
+    ] {
+        store.propose(&r).unwrap();
+        if accept {
+            store.review(&r.id, 1, ReviewState::Accepted).unwrap();
+        }
+    }
+    let out = run_hook(
+        &wt,
+        "claude",
+        &format!(
+            r#"{{"hook_event_name":"SessionStart","cwd":"{}"}}"#,
+            wt.display()
+        ),
+        &[],
+    );
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let text = stdout["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let constraints = text.split("## Open work").next().unwrap();
+    // Review appends a version, so accepted records are at v2.
+    for id in [
+        "decision-primary@v2",
+        "decision-shared@v2",
+        "decision-local@v2",
+    ] {
+        assert!(constraints.contains(id), "{text}");
+    }
+    assert!(!constraints.contains("task-local-proposal"), "{text}");
+    assert!(
+        text.contains("unreviewed task proposal; not settled: task-local-proposal"),
+        "{text}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+    fs::remove_dir_all(wt).unwrap();
+}
+
+/// Malformed hook structure fails install before anything is written; a
+/// write failure part-way rolls back the files already changed. Either way
+/// no registration, temp files, or created directories are left behind.
+#[test]
+fn install_is_validated_and_transactional() {
+    let dir = git_repo("install-tx");
+    let info = RepoInfo::discover(&dir).unwrap();
+    let claude = dir.join(".claude/settings.local.json");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    let original = r#"{"model":"x"}"#;
+    fs::write(&claude, original).unwrap();
+    let codex = dir.join(".codex/hooks.json");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    let residue = |dir: &Path| {
+        let mut names: Vec<String> = [".claude", ".codex"]
+            .iter()
+            .filter_map(|d| fs::read_dir(dir.join(d)).ok())
+            .flatten()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    for bad in [r#"{"hooks":{"Stop":{}}}"#, r#"{"hooks":[]}"#] {
+        fs::write(&codex, bad).unwrap();
+        let err = doclify_capture::install::install(&info, "doclify-capture").unwrap_err();
+        assert!(err.to_string().contains("hooks.json"), "{err}");
+        assert_eq!(fs::read_to_string(&claude).unwrap(), original);
+        assert_eq!(fs::read_to_string(&codex).unwrap(), bad);
+        assert!(!info.registered());
+        assert!(!info.common_dir.join("doclify").exists());
+        assert_eq!(residue(&dir), ["hooks.json", "settings.local.json"]);
+    }
+    // The CLI reports the failure instead of printing "installed".
+    let out = Command::new(BIN)
+        .arg("install")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("installed"));
+
+    // `.codex` is a file, so the second write fails after the first succeeded.
+    fs::remove_dir_all(dir.join(".claude")).unwrap();
+    fs::remove_dir_all(dir.join(".codex")).unwrap();
+    fs::write(dir.join(".codex"), "").unwrap();
+    assert!(doclify_capture::install::install(&info, "doclify-capture").is_err());
+    assert!(!dir.join(".claude").exists(), "created config rolled back");
+    assert!(!info.common_dir.join("doclify").exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Deferral is only for transcripts still being started; a hook naming a file
+/// that is not a transcript goes straight to the worker to be rejected.
+#[test]
+fn non_transcript_paths_are_not_deferred() {
+    let dir = git_repo("not-deferred");
+    let info = RepoInfo::discover(&dir).unwrap();
+    doclify_capture::install::install(&info, "doclify-capture").unwrap();
+    let secret = dir.join("secret.jsonl");
+    fs::write(&secret, "secret\n").unwrap();
+    run_hook(
+        &dir,
+        "claude",
+        &format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","transcript_path":"{}"}}"#,
+            secret.display()
+        ),
+        &[],
+    );
+    assert_eq!(queued(&dir), 1);
     fs::remove_dir_all(dir).unwrap();
 }

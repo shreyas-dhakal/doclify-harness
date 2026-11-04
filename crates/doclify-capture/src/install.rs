@@ -21,7 +21,14 @@ use crate::{Agent, RepoInfo};
 pub const MARKER: &str = ": doclify-hook=1;";
 /// Command the hooks invoke; resolved via PATH so the Codex file stays portable.
 pub const DEFAULT_EXE: &str = "doclify-capture";
-const EVENTS: [&str; 6] = ["SessionStart", "UserPromptSubmit", "Stop", "SubagentStop", "PostToolUse", "PostToolUseFailure"];
+pub const EVENTS: [&str; 6] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStop",
+    "PostToolUse",
+    "PostToolUseFailure",
+];
 const TIMEOUT_SECS: u64 = 5;
 const AGENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
 /// Per-worktree opt-out, under that worktree's own Git directory.
@@ -45,26 +52,29 @@ pub fn hook_command(exe: &str, agent: Agent) -> String {
 }
 
 /// Registers the repository for capture, installs both agents' hooks here, and
-/// reconciles the repository's other worktrees.
+/// reconciles the repository's other worktrees. All-or-nothing: both configs
+/// are validated before any write, and a later failure restores every file
+/// and directory this call created or changed, registration included.
 pub fn install(repo: &RepoInfo, exe: &str) -> io::Result<Vec<PathBuf>> {
-    fs::create_dir_all(repo.common_dir.join("doclify/queue"))?;
-    fs::create_dir_all(repo.queue_dir())?;
-    match fs::remove_file(repo.git_dir.join(OPT_OUT)) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    let mut paths = AGENTS
-
+    let plans = AGENTS
         .into_iter()
         .map(|agent| {
-            let path = config_path(&repo.worktree, agent);
-            edit(&path, |root| {
+            plan(&config_path(&repo.worktree, agent), |root| {
                 remove_ours(root);
-                add_ours(root, &hook_command(exe, agent));
-            })?;
-            Ok(path)
+                add_ours(root, &hook_command(exe, agent))
+            })
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let mut paths: Vec<PathBuf> = plans.iter().map(|p| p.path.clone()).collect();
+    commit(plans, |created| {
+        for dir in [repo.common_dir.join("doclify/queue"), repo.queue_dir()] {
+            create_dirs(&dir, created)?;
+        }
+        match fs::remove_file(repo.git_dir.join(OPT_OUT)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    })?;
     paths.extend(reconcile(repo));
     Ok(paths)
 }
@@ -95,8 +105,9 @@ pub fn reconcile(repo: &RepoInfo) -> Vec<PathBuf> {
             let path = config_path(wt, agent);
             let added = edit(&path, |root| {
                 if our_command(root).is_none() {
-                    add_ours(root, &command);
+                    add_ours(root, &command)?;
                 }
+                Ok(())
             });
             if added.unwrap_or(false) {
                 changed.push(path);
@@ -109,18 +120,30 @@ pub fn reconcile(repo: &RepoInfo) -> Vec<PathBuf> {
 /// Removes only Doclify's entries in this worktree and opts it out of
 /// `reconcile`. Captured data in the queue is left alone.
 pub fn uninstall(repo: &RepoInfo) -> io::Result<Vec<PathBuf>> {
-    if repo.registered() {
-        let marker = repo.git_dir.join(OPT_OUT);
-        fs::create_dir_all(marker.parent().unwrap())?;
-        fs::write(marker, "")?;
-    }
-    let mut changed = Vec::new();
-    for agent in AGENTS {
-        let path = config_path(&repo.worktree, agent);
-        if path.exists() && edit(&path, remove_ours)? {
-            changed.push(path);
+    let plans = AGENTS
+        .into_iter()
+        .map(|agent| config_path(&repo.worktree, agent))
+        .filter(|path| path.exists())
+        .map(|path| {
+            plan(&path, |root| {
+                remove_ours(root);
+                Ok(())
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let changed = plans
+        .iter()
+        .filter(|p| p.after.is_some())
+        .map(|p| p.path.clone())
+        .collect();
+    commit(plans, |created| {
+        if repo.registered() {
+            let marker = repo.git_dir.join(OPT_OUT);
+            create_dirs(marker.parent().unwrap(), created)?;
+            fs::write(marker, "")?;
         }
-    }
+        Ok(())
+    })?;
     Ok(changed)
 }
 
@@ -136,30 +159,101 @@ fn git_dir(worktree: &Path) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// Read-modify-write that refuses to touch unparseable files and replaces
-/// atomically. Returns whether anything changed.
-fn edit(path: &Path, f: impl FnOnce(&mut Map<String, Value>)) -> io::Result<bool> {
+/// A validated config change: the file's prior text (`None` if absent) and
+/// its replacement (`None` if unchanged).
+struct Plan {
+    path: PathBuf,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+/// Parses and edits in memory, refusing unparseable files and unexpected
+/// structure. Nothing is written.
+fn plan(
+    path: &Path,
+    f: impl FnOnce(&mut Map<String, Value>) -> Result<(), String>,
+) -> io::Result<Plan> {
     let before = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => "{}".into(),
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    let mut value: Value = serde_json::from_str(&before).map_err(|e| invalid(path, e))?;
+    let mut value: Value =
+        serde_json::from_str(before.as_deref().unwrap_or("{}")).map_err(|e| invalid(path, e))?;
     let root = value
         .as_object_mut()
         .ok_or_else(|| invalid(path, "top level is not an object"))?;
     let original = root.clone();
-    f(root);
-    if *root == original {
-        return Ok(false);
+    f(root).map_err(|e| invalid(path, e))?;
+    let after = (*root != original)
+        .then(|| serde_json::to_string_pretty(&value).map(|s| s + "\n"))
+        .transpose()?;
+    Ok(Plan {
+        path: path.to_owned(),
+        before,
+        after,
+    })
+}
+
+/// Writes every plan, then runs `then`. On any failure, restores the files
+/// already written and removes directories this call created, newest first.
+fn commit(
+    plans: Vec<Plan>,
+    then: impl FnOnce(&mut Vec<PathBuf>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut created = Vec::new();
+    let mut written = Vec::new();
+    let result = (|| {
+        for p in &plans {
+            let Some(after) = &p.after else { continue };
+            if let Some(dir) = p.path.parent() {
+                create_dirs(dir, &mut created)?;
+            }
+            write_atomic(&p.path, after)?;
+            written.push(p);
+        }
+        then(&mut created)
+    })();
+    if result.is_err() {
+        for p in written.into_iter().rev() {
+            let _ = match &p.before {
+                Some(text) => write_atomic(&p.path, text),
+                None => fs::remove_file(&p.path),
+            };
+        }
+        for dir in created.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
+    result
+}
+
+/// `create_dir_all`, recording each directory it actually created.
+fn create_dirs(dir: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.exists()).collect();
+    fs::create_dir_all(dir)?;
+    created.extend(missing.into_iter().rev().map(Path::to_path_buf));
+    Ok(())
+}
+
+fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     let tmp = path.with_extension("json.doclify-tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(&value)? + "\n")?;
-    fs::rename(&tmp, path)?;
-    Ok(true)
+    let result = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Single-file `plan` + `commit`. Returns whether anything changed.
+fn edit(
+    path: &Path,
+    f: impl FnOnce(&mut Map<String, Value>) -> Result<(), String>,
+) -> io::Result<bool> {
+    let plan = plan(path, f)?;
+    let changed = plan.after.is_some();
+    commit(vec![plan], |_| Ok(()))?;
+    Ok(changed)
 }
 
 fn invalid(path: &Path, e: impl std::fmt::Display) -> io::Error {
@@ -169,19 +263,27 @@ fn invalid(path: &Path, e: impl std::fmt::Display) -> io::Error {
     )
 }
 
-fn add_ours(root: &mut Map<String, Value>, command: &str) {
-    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks) = hooks.as_object_mut() else {
-        return;
-    };
-    for event in EVENTS {
-        let groups = hooks.entry(event).or_insert_with(|| json!([]));
-        if let Some(groups) = groups.as_array_mut() {
-            groups.push(json!({
-                "hooks": [{ "type": "command", "command": command, "timeout": TIMEOUT_SECS }]
-            }));
+/// Fails, leaving `root` untouched, if `hooks` or any event we use is not the
+/// shape both agents document, so install never reports a partial success.
+fn add_ours(root: &mut Map<String, Value>, command: &str) -> Result<(), String> {
+    if let Some(hooks) = root.get("hooks") {
+        let hooks = hooks.as_object().ok_or("`hooks` is not an object")?;
+        if let Some(event) = EVENTS
+            .into_iter()
+            .find(|e| hooks.get(*e).is_some_and(|v| !v.is_array()))
+        {
+            return Err(format!("`hooks.{event}` is not an array"));
         }
     }
+    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
+    let hooks = hooks.as_object_mut().expect("checked above");
+    for event in EVENTS {
+        let groups = hooks.entry(event).or_insert_with(|| json!([]));
+        groups.as_array_mut().expect("checked above").push(json!({
+            "hooks": [{ "type": "command", "command": command, "timeout": TIMEOUT_SECS }]
+        }));
+    }
+    Ok(())
 }
 
 fn our_command(root: &Map<String, Value>) -> Option<&str> {
@@ -247,14 +349,20 @@ mod tests {
         let mut root = original.clone();
         for _ in 0..2 {
             remove_ours(&mut root);
-            add_ours(&mut root, &hook_command("doclify-capture", Agent::Claude));
+            add_ours(&mut root, &hook_command("doclify-capture", Agent::Claude)).unwrap();
         }
         let start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(start.len(), 2, "existing group kept, ours added once");
         assert_eq!(start[0]["hooks"][0]["command"], "orca-hook");
         assert_eq!(root["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert_eq!(root["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
-        assert_eq!(root["hooks"]["PostToolUseFailure"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            root["hooks"]["PostToolUseFailure"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         remove_ours(&mut root);
         // Pre-existing empty event arrays are user state and survive.
@@ -264,7 +372,7 @@ mod tests {
     #[test]
     fn uninstall_drops_hooks_key_we_created() {
         let mut root = Map::new();
-        add_ours(&mut root, &hook_command("x", Agent::Codex));
+        add_ours(&mut root, &hook_command("x", Agent::Codex)).unwrap();
         remove_ours(&mut root);
         assert!(root.is_empty());
     }
@@ -305,6 +413,13 @@ mod tests {
         fs::write(&path, "{ not json").unwrap();
         assert!(edit(&path, |r| add_ours(r, "x")).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+        fs::write(&path, r#"{"hooks":{"Stop":{"x":1}}}"#).unwrap();
+        let err = edit(&path, |r| add_ours(r, "x")).unwrap_err().to_string();
+        assert!(err.contains("hooks.Stop"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{"hooks":{"Stop":{"x":1}}}"#
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

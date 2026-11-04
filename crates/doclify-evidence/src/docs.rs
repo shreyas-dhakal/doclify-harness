@@ -4,7 +4,9 @@
 //! overlap it are never overwritten, and the regeneration is written to
 //! `.doclify/conflicts/` for review instead.
 use crate::{load_records, write_atomic, Basis, Evidence, Github, TestOutcome, TestSource};
-use doclify_domain::{ExperimentOutcome, ImplementationState, Record, RecordKind, ReviewState, Store};
+use doclify_domain::{
+    ExperimentOutcome, ImplementationState, Record, RecordKind, ReviewState, Store,
+};
 use serde::Serialize;
 use std::{fmt::Write, fs, io, path::Path};
 
@@ -44,10 +46,17 @@ pub fn generate(repo: &Path, evidence: Option<&Evidence>) -> io::Result<Report> 
     let store = Store::open(repo)?;
     let mut entries = Vec::new();
     for history in load_records(repo)? {
-        let latest = history.last().cloned().expect("load_records skips empty histories");
+        let latest = history
+            .last()
+            .cloned()
+            .expect("load_records skips empty histories");
         let accepted = store.accepted(&latest.id)?;
         let pending = (latest.review == ReviewState::Proposed).then(|| latest.clone());
-        entries.push(Entry { accepted, pending, latest });
+        entries.push(Entry {
+            accepted,
+            pending,
+            latest,
+        });
     }
     let files = git_files(repo);
     let mut report = Report::default();
@@ -132,15 +141,26 @@ fn reconcile(repo: &Path, name: &str, new: &str, report: &mut Report) -> io::Res
 
 /// Line-based three-way merge. `None` when edits overlap or there is no
 /// baseline (a page that predates Doclify is all human edit).
-fn merge(repo: &Path, current: Option<&str>, baseline: Option<&str>, new: &str) -> io::Result<Option<String>> {
-    let (Some(current), Some(baseline)) = (current, baseline) else { return Ok(None) };
+fn merge(
+    repo: &Path,
+    current: Option<&str>,
+    baseline: Option<&str>,
+    new: &str,
+) -> io::Result<Option<String>> {
+    let (Some(current), Some(baseline)) = (current, baseline) else {
+        return Ok(None);
+    };
     let dir = repo.join(".doclify/conflicts");
     let tmp = |tag: &str, text: &str| -> io::Result<std::path::PathBuf> {
         let path = dir.join(format!(".merge-{}-{tag}.tmp", std::process::id()));
         fs::write(&path, text)?;
         Ok(path)
     };
-    let files = [tmp("current", current)?, tmp("base", baseline)?, tmp("new", new)?];
+    let files = [
+        tmp("current", current)?,
+        tmp("base", baseline)?,
+        tmp("new", new)?,
+    ];
     let out = std::process::Command::new("git")
         .arg("merge-file")
         .arg("-p")
@@ -151,9 +171,14 @@ fn merge(repo: &Path, current: Option<&str>, baseline: Option<&str>, new: &str) 
     }
     let out = out?;
     match out.status.code() {
-        Some(0) => String::from_utf8(out.stdout).map(Some).map_err(|e| crate::invalid(&e.to_string())),
+        Some(0) => String::from_utf8(out.stdout)
+            .map(Some)
+            .map_err(|e| crate::invalid(&e.to_string())),
         Some(1..=127) => Ok(None),
-        _ => Err(io::Error::other(format!("git merge-file: {}", String::from_utf8_lossy(&out.stderr).trim()))),
+        _ => Err(io::Error::other(format!(
+            "git merge-file: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
     }
 }
 
@@ -191,13 +216,20 @@ fn overview(entries: &[Entry], files: &[String], evidence: Option<&Evidence>) ->
     let mut s = String::from("## Purpose\n\n");
     let _ = writeln!(s, "{UNKNOWN}\n");
     s.push_str("## Repository-observed facts\n\n");
-    let mut top: Vec<&str> = files.iter().map(|f| f.split('/').next().unwrap_or(f)).collect();
+    let mut top: Vec<&str> = files
+        .iter()
+        .map(|f| f.split('/').next().unwrap_or(f))
+        .collect();
     top.dedup();
     let _ = writeln!(s, "- Tracked files: {}", files.len());
     let _ = writeln!(
         s,
         "- Top-level entries: {}",
-        if top.is_empty() { "none".into() } else { top.iter().map(|t| code(t)).collect::<Vec<_>>().join(", ") }
+        if top.is_empty() {
+            "none".into()
+        } else {
+            top.iter().map(|t| code(t)).collect::<Vec<_>>().join(", ")
+        }
     );
     match evidence {
         Some(e) => {
@@ -206,11 +238,24 @@ fn overview(entries: &[Entry], files: &[String], evidence: Option<&Evidence>) ->
         }
         None => s.push_str("- Git evidence: not synced yet.\n"),
     }
-    let count = |k: RecordKind| entries.iter().filter(|e| e.latest.kind == k && e.accepted.is_some()).count();
+    let count = |k: RecordKind| {
+        entries
+            .iter()
+            .filter(|e| e.latest.kind == k && e.accepted.is_some())
+            .count()
+    };
     s.push_str("\n## Reviewed intent\n\n");
-    let _ = writeln!(s, "- Accepted requirements: {}", count(RecordKind::Requirement));
+    let _ = writeln!(
+        s,
+        "- Accepted requirements: {}",
+        count(RecordKind::Requirement)
+    );
     let _ = writeln!(s, "- Accepted decisions: {}", count(RecordKind::Decision));
-    let _ = writeln!(s, "- Records awaiting review: {}", entries.iter().filter(|e| e.pending.is_some()).count());
+    let _ = writeln!(
+        s,
+        "- Records awaiting review: {}",
+        entries.iter().filter(|e| e.pending.is_some()).count()
+    );
     s
 }
 
@@ -242,7 +287,11 @@ fn setup(files: &[String]) -> String {
     let mut s = String::from("## Setup steps\n\n");
     let _ = writeln!(s, "{UNKNOWN}\n");
     s.push_str("## Repository-observed facts\n\n");
-    let readmes = files.iter().filter(|f| f.rsplit('/').next().is_some_and(|n| n.to_ascii_lowercase().starts_with("readme")));
+    let readmes = files.iter().filter(|f| {
+        f.rsplit('/')
+            .next()
+            .is_some_and(|n| n.to_ascii_lowercase().starts_with("readme"))
+    });
     s.push_str("Readme files:\n\n");
     list(&mut s, readmes.map(|r| code(r)));
     s.push_str("\nBuild manifests:\n\n");
@@ -263,7 +312,11 @@ fn list(s: &mut String, items: impl Iterator<Item = String>) {
 fn records(entries: &[Entry], kind: RecordKind, evidence: Option<&Evidence>) -> String {
     let mine: Vec<&Entry> = entries.iter().filter(|e| e.latest.kind == kind).collect();
     let mut s = String::from("## Accepted\n\n");
-    let accepted: Vec<&Entry> = mine.iter().copied().filter(|e| e.accepted.is_some()).collect();
+    let accepted: Vec<&Entry> = mine
+        .iter()
+        .copied()
+        .filter(|e| e.accepted.is_some())
+        .collect();
     if accepted.is_empty() {
         s.push_str("None accepted.\n\n");
     }
@@ -280,7 +333,11 @@ fn records(entries: &[Entry], kind: RecordKind, evidence: Option<&Evidence>) -> 
         }
     }
     s.push_str("## Proposed, not accepted\n\nThese are suggestions only.\n\n");
-    let proposed: Vec<&Entry> = mine.iter().copied().filter(|e| e.accepted.is_none() && e.pending.is_some()).collect();
+    let proposed: Vec<&Entry> = mine
+        .iter()
+        .copied()
+        .filter(|e| e.accepted.is_none() && e.pending.is_some())
+        .collect();
     if proposed.is_empty() {
         s.push_str("None.\n\n");
     }
@@ -302,20 +359,44 @@ fn record(s: &mut String, r: &Record, evidence: Option<&Evidence>) {
     let _ = writeln!(
         s,
         "- Rationale: {}",
-        if r.rationale.trim().is_empty() { "Unknown.".into() } else { esc(&r.rationale) }
+        if r.rationale.trim().is_empty() {
+            "Unknown.".into()
+        } else {
+            esc(&r.rationale)
+        }
     );
     let source_link = format!("../../.doclify/records/{}/{:020}.json", r.id, r.version);
     for p in &r.provenance {
         match &p.excerpt {
-            Some(x) => { let _ = writeln!(s, "- Source [{}]({}): \"{}\"", code(&p.source), source_link, esc(x)); }
-            None => { let _ = writeln!(s, "- Source [{}]({})", code(&p.source), source_link); }
+            Some(x) => {
+                let _ = writeln!(
+                    s,
+                    "- Source [{}]({}): \"{}\"",
+                    code(&p.source),
+                    source_link,
+                    esc(x)
+                );
+            }
+            None => {
+                let _ = writeln!(s, "- Source [{}]({})", code(&p.source), source_link);
+            }
         }
     }
     for e in &r.evidence {
         let _ = writeln!(s, "- Evidence: {}", code(e));
     }
-    for l in evidence.into_iter().flat_map(|e| &e.links).filter(|l| l.record == r.id) {
-        let _ = writeln!(s, "- {}: {} ({})", basis(l.basis), code(&short(&l.target)), esc(&l.reason));
+    for l in evidence
+        .into_iter()
+        .flat_map(|e| &e.links)
+        .filter(|l| l.record == r.id)
+    {
+        let _ = writeln!(
+            s,
+            "- {}: {} ({})",
+            basis(l.basis),
+            code(&short(&l.target)),
+            esc(&l.reason)
+        );
     }
     s.push('\n');
 }
@@ -329,7 +410,15 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
     );
     list(
         &mut s,
-        e.links.iter().map(|l| format!("{}: {} to {} ({})", basis(l.basis), code(&l.record), code(&short(&l.target)), esc(&l.reason))),
+        e.links.iter().map(|l| {
+            format!(
+                "{}: {} to {} ({})",
+                basis(l.basis),
+                code(&l.record),
+                code(&short(&l.target)),
+                esc(&l.reason)
+            )
+        }),
     );
     s.push_str(
         "\n## Test evidence\n\nObserved runs were seen through tool hooks; claims are what an agent said and were not observed. \
@@ -352,12 +441,18 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
                 },
                 esc(&t.agent),
                 code(&t.session),
-                t.revision.as_deref().map_or("unknown revision".into(), |r| code(&r[..r.len().min(12)])),
-                t.stale.as_ref().map_or(String::new(), |why| format!(" **Stale:** {}", esc(why))),
+                t.revision
+                    .as_deref()
+                    .map_or("unknown revision".into(), |r| code(&r[..r.len().min(12)])),
+                t.stale
+                    .as_ref()
+                    .map_or(String::new(), |why| format!(" **Stale:** {}", esc(why))),
             )
         }),
     );
-    s.push_str("\n## Session associations\n\nSuggested associations are inferred and unconfirmed.\n\n");
+    s.push_str(
+        "\n## Session associations\n\nSuggested associations are inferred and unconfirmed.\n\n",
+    );
     list(
         &mut s,
         e.sessions.iter().map(|l| {
@@ -372,10 +467,29 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
         }),
     );
     s.push_str("\n## Branches\n\n");
-    list(&mut s, e.branches.iter().map(|b| format!("{} at {}", code(&b.name), code(&b.head[..b.head.len().min(12)]))));
+    list(
+        &mut s,
+        e.branches.iter().map(|b| {
+            format!(
+                "{} at {}",
+                code(&b.name),
+                code(&b.head[..b.head.len().min(12)])
+            )
+        }),
+    );
     s.push_str("\n## Recent commits\n\n");
     // ponytail: fixed cap keeps the tracked page small; the full set stays in local evidence.json.
-    list(&mut s, e.commits.iter().take(50).map(|c| format!("{} {} ({} files)", code(&c.sha[..c.sha.len().min(12)]), esc(&c.subject), c.files.len())));
+    list(
+        &mut s,
+        e.commits.iter().take(50).map(|c| {
+            format!(
+                "{} {} ({} files)",
+                code(&c.sha[..c.sha.len().min(12)]),
+                esc(&c.subject),
+                c.files.len()
+            )
+        }),
+    );
     s.push_str("\n## Pull requests\n\n");
     match &e.github {
         Github::Unavailable { reason } => {
@@ -384,13 +498,21 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
         Github::Available { pull_requests } => list(
             &mut s,
             pull_requests.iter().map(|p| {
-                let reviews: Vec<String> = p.reviews.iter().map(|r| format!("{} {}", esc(&r.author), esc(&r.state))).collect();
+                let reviews: Vec<String> = p
+                    .reviews
+                    .iter()
+                    .map(|r| format!("{} {}", esc(&r.author), esc(&r.state)))
+                    .collect();
                 let merged = match (&p.merged_at, &p.merged_by, &p.merge_commit) {
                     (Some(at), by, commit) => format!(
                         ", merged {}{}{}",
                         esc(at),
-                        by.as_ref().map_or(String::new(), |b| format!(" by {}", esc(b))),
-                        commit.as_ref().map_or(String::new(), |c| format!(" as {}", code(&c[..c.len().min(12)]))),
+                        by.as_ref()
+                            .map_or(String::new(), |b| format!(" by {}", esc(b))),
+                        commit.as_ref().map_or(String::new(), |c| format!(
+                            " as {}",
+                            code(&c[..c.len().min(12)])
+                        )),
                     ),
                     _ => String::new(),
                 };
@@ -401,7 +523,11 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
                     esc(&p.state),
                     merged,
                     p.review_decision.as_deref().map_or("none".into(), esc),
-                    if reviews.is_empty() { "none".into() } else { reviews.join(", ") },
+                    if reviews.is_empty() {
+                        "none".into()
+                    } else {
+                        reviews.join(", ")
+                    },
                     p.comment_count,
                     esc(&p.url)
                 )
@@ -412,8 +538,12 @@ fn evidence_page(evidence: Option<&Evidence>) -> String {
 }
 
 fn open_work(entries: &[Entry]) -> String {
-    let mut s = String::from("## Awaiting review\n\nSuggestions only; not settled constraints.\n\n");
-    list(&mut s, entries.iter().filter_map(|e| e.pending.as_ref()).map(line));
+    let mut s =
+        String::from("## Awaiting review\n\nSuggestions only; not settled constraints.\n\n");
+    list(
+        &mut s,
+        entries.iter().filter_map(|e| e.pending.as_ref()).map(line),
+    );
     s.push_str("\n## Accepted, not yet implemented\n\n");
     list(
         &mut s,
@@ -423,12 +553,16 @@ fn open_work(entries: &[Entry]) -> String {
             .filter(|r| r.implementation != ImplementationState::Implemented)
             .map(line),
     );
-    s.push_str("\n## Implemented, not accepted\n\nThese exist in code without an accepted decision.\n\n");
+    s.push_str(
+        "\n## Implemented, not accepted\n\nThese exist in code without an accepted decision.\n\n",
+    );
     list(
         &mut s,
         entries
             .iter()
-            .filter(|e| e.accepted.is_none() && e.latest.implementation == ImplementationState::Implemented)
+            .filter(|e| {
+                e.accepted.is_none() && e.latest.implementation == ImplementationState::Implemented
+            })
             .map(|e| line(&e.latest)),
     );
     s.push_str("\n## Open questions and tasks\n\n");
@@ -438,12 +572,17 @@ fn open_work(entries: &[Entry]) -> String {
             .iter()
             .map(|e| e.accepted.as_ref().unwrap_or(&e.latest))
             .filter(|r| matches!(r.kind, RecordKind::Question | RecordKind::Task))
-            .filter(|r| r.review != ReviewState::Rejected && r.implementation != ImplementationState::Implemented)
+            .filter(|r| {
+                r.review != ReviewState::Rejected
+                    && r.implementation != ImplementationState::Implemented
+            })
             .map(line),
     );
     s.push_str("\n## Active experiments\n\n");
     list(&mut s, experiments(entries, ExperimentOutcome::Active));
-    s.push_str("\n## Abandoned experiments\n\nHistory only. Do not treat these as instructions.\n\n");
+    s.push_str(
+        "\n## Abandoned experiments\n\nHistory only. Do not treat these as instructions.\n\n",
+    );
     list(&mut s, experiments(entries, ExperimentOutcome::Abandoned));
     s
 }

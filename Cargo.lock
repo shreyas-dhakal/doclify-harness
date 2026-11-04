@@ -339,6 +339,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "doclify-context",
+ "doclify-domain",
  "fs2",
  "serde_json",
  "sha2 0.10.9",
@@ -392,6 +393,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "doclify-capture",
+ "doclify-context",
  "doclify-domain",
  "doclify-model-bridge",
  "serde_json",
