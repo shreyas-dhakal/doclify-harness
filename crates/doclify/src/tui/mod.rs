@@ -1,7 +1,16 @@
+mod app;
+mod terminal;
+mod ui;
 pub mod workflow;
 
 use std::process::ExitCode;
 
 pub fn run() -> ExitCode {
-    ExitCode::SUCCESS
+    match app::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("doclify: terminal interface failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
