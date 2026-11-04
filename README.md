@@ -4,6 +4,25 @@ Doclify captures Codex and Claude Code sessions, turns them into documentation p
 
 ## Setup
 
+### Homebrew
+
+On macOS, install the current `main` branch with Homebrew (Rust is installed as a build dependency):
+
+```sh
+brew tap shreyas-dhakal/doclify https://github.com/shreyas-dhakal/doclify-harness
+brew install --HEAD doclify
+```
+
+Then, in the repository you want to document:
+
+```sh
+cd /path/to/your/repository
+doclify init
+doclify doctor
+```
+
+### Build from source
+
 Install Rust and Cargo, then build and install Doclify:
 
 ```sh
