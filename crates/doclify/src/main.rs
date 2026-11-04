@@ -1,4 +1,5 @@
 mod recovery;
+mod tui;
 use doclify_capture::queue::Queue;
 use doclify_capture::{hook, install, Agent, RepoInfo};
 use doclify_domain::{ImplementationState, Provenance, Record, RecordKind, ReviewState, Store};
@@ -71,7 +72,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     if args.is_empty() {
-        return repl();
+        return tui::run();
     }
     if args.as_slice() == ["docs"] || args.as_slice() == ["docs", "--json"] {
         return docs(false);

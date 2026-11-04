@@ -15,6 +15,8 @@ doclify-context = { path = "../doclify-context" }
 doclify-pipeline = { path = "../doclify-pipeline" }
 doclify-viewer = { path = "../../viewer" }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+ratatui = "0.30.2"
+crossterm = "0.29.0"
 
 [dev-dependencies]
 tempfile = "3"
