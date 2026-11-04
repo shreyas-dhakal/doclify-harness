@@ -1,4 +1,5 @@
 mod app;
+mod commands;
 mod terminal;
 mod ui;
 pub mod workflow;

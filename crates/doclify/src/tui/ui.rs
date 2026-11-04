@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -39,7 +39,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     draw_conversation(frame, rows[1], app);
     draw_flow(frame, rows[2], app.snapshot.as_ref());
-    draw_input(frame, rows[3], &app.input, &app.status);
+    draw_input(frame, rows[3], &app.input, app.cursor, &app.status, app.busy);
+    if let Some(choices) = app.model_choices.as_ref() {
+        draw_model_picker(frame, area, choices, app.model_selection);
+    }
 }
 
 fn draw_header(
@@ -117,30 +120,34 @@ fn draw_header(
 }
 
 fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
-    let items: Vec<ListItem> = app
-        .messages
-        .iter()
-        .map(|message| {
-            let (color, label) = if message.role == "you" {
-                (BLUE, "YOU")
-            } else {
-                (ACCENT, "DOC")
-            };
-            ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!("{label}  "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    message.text.as_str(),
-                    Style::default().fg(TEXT),
-                )),
-                Line::from(""),
-            ])
-        })
-        .collect();
-    let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Rgb(28, 36, 48)))
+    let inner_width = area.width.saturating_sub(6).max(1) as usize;
+    let mut lines = Vec::new();
+    let mut wrapped_height = 0usize;
+    for message in &app.messages {
+        let (color, label) = if message.role == "you" {
+            (BLUE, "YOU")
+        } else {
+            (ACCENT, "DOC")
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{label}  "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+        wrapped_height += 1;
+        for text_line in message.text.lines() {
+            let line = Line::from(Span::styled(text_line, Style::default().fg(TEXT)));
+            wrapped_height += line.width().max(1).div_ceil(inner_width);
+            lines.push(line);
+        }
+        lines.push(Line::from(""));
+        wrapped_height += 1;
+    }
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = wrapped_height.saturating_sub(inner_height);
+    let scroll = max_scroll.saturating_sub(app.conversation_from_bottom).min(u16::MAX as usize) as u16;
+    let conversation = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .scroll((scroll, 0))
         .block(
             Block::default()
                 .title(Span::styled(
@@ -151,16 +158,12 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
                 .border_style(Style::default().fg(Color::Rgb(47, 58, 74)))
                 .padding(ratatui::widgets::Padding::new(2, 2, 1, 0)),
         );
-    if app.conversation.selected().is_none() {
-        app.conversation
-            .select(Some(app.messages.len().saturating_sub(1)));
-    }
-    frame.render_stateful_widget(list, area, &mut app.conversation);
+    frame.render_widget(conversation, area);
 }
 
-fn count(value: Option<usize>) -> String {
+fn count(value: Option<usize>, description: &str) -> String {
     value
-        .map(|number| number.to_string())
+        .map(|number| format!("{number} {description}"))
         .unwrap_or_else(|| "?".into())
 }
 
@@ -168,10 +171,10 @@ fn draw_flow(frame: &mut Frame, area: Rect, snapshot: Option<&WorkflowSnapshot>)
     let (capture, propose, review, docs) = snapshot
         .map(|snapshot| {
             (
-                count(snapshot.pending_capture_events),
-                count(snapshot.pending_extraction),
-                count(snapshot.pending_review),
-                count(snapshot.documentation_files),
+                count(snapshot.pending_capture_events, "new"),
+                count(snapshot.pending_extraction, "queued"),
+                count(snapshot.pending_review, "to review"),
+                count(snapshot.documentation_files, "files"),
             )
         })
         .unwrap_or_else(|| ("?".into(), "?".into(), "?".into(), "?".into()));
@@ -212,19 +215,35 @@ fn draw_flow(frame: &mut Frame, area: Rect, snapshot: Option<&WorkflowSnapshot>)
     );
 }
 
-fn draw_input(frame: &mut Frame, area: Rect, input: &str, status: &str) {
+fn draw_input(frame: &mut Frame, area: Rect, input: &str, cursor: usize, status: &str, busy: bool) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Length(1)])
         .split(area);
-    let prompt = Paragraph::new(Line::from(vec![
+    let cursor_byte = input
+        .char_indices()
+        .nth(cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len());
+    let before = &input[..cursor_byte];
+    let after = &input[cursor_byte..];
+    let mut input_spans = vec![
         Span::styled(
             "› ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(input, Style::default().fg(TEXT)),
-        Span::styled("▏", Style::default().fg(ACCENT)),
-    ]))
+        Span::styled(before, Style::default().fg(TEXT)),
+    ];
+    if let Some(current) = after.chars().next() {
+        input_spans.push(Span::styled(
+            current.to_string(),
+            Style::default().fg(PANEL).bg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        input_spans.push(Span::styled(&after[current.len_utf8()..], Style::default().fg(TEXT)));
+    } else {
+        input_spans.push(Span::styled("▏", Style::default().fg(ACCENT)));
+    }
+    let prompt = Paragraph::new(Line::from(input_spans))
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -237,7 +256,7 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &str, status: &str) {
     );
     frame.render_widget(prompt, chunks[0]);
     let help = Paragraph::new(Line::from(vec![
-        Span::styled(status, Style::default().fg(MUTED)),
+        Span::styled(if busy { "Working…" } else { status }, Style::default().fg(MUTED)),
         Span::styled(
             "   ·   Enter send   ↑↓ history   PgUp/PgDn scroll   Ctrl-C quit   /help",
             Style::default().fg(Color::Rgb(103, 119, 141)),
@@ -245,4 +264,59 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &str, status: &str) {
     ]))
     .wrap(Wrap { trim: true });
     frame.render_widget(help, chunks[1]);
+}
+
+fn draw_model_picker(
+    frame: &mut Frame,
+    area: Rect,
+    choices: &[super::commands::ModelChoice],
+    selected: usize,
+) {
+    let popup = centered_rect(68, area);
+    frame.render_widget(Clear, popup);
+    let items = choices
+        .iter()
+        .map(|choice| {
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    choice.id.as_str(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(choice.status.as_str(), Style::default().fg(MUTED))),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().bg(Color::Rgb(34, 46, 62)).fg(BLUE))
+        .block(
+            Block::default()
+                .title(" Choose a model · ↑/↓ move · Enter select · Esc cancel ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(PANEL))
+                .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
+        );
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn centered_rect(percent: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent) / 2),
+            Constraint::Percentage(percent),
+            Constraint::Percentage((100 - percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent) / 2),
+            Constraint::Percentage(percent),
+            Constraint::Percentage((100 - percent) / 2),
+        ])
+        .split(vertical[1])[1]
 }

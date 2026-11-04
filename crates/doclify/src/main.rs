@@ -7,7 +7,7 @@ use doclify_model_bridge::{Bridge, Capability};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, IsTerminal, Write},
     process::ExitCode,
 };
 
@@ -72,7 +72,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     if args.is_empty() {
-        return tui::run();
+        return if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            tui::run()
+        } else {
+            repl()
+        };
     }
     if args.as_slice() == ["docs"] || args.as_slice() == ["docs", "--json"] {
         return docs(false);
@@ -698,31 +702,10 @@ fn handoff(repo: &RepoInfo, topic: Option<String>) -> Result<Value, Box<dyn std:
 }
 fn docs(background: bool) -> ExitCode {
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let repo =
-            RepoInfo::discover(&std::env::current_dir()?).ok_or("not inside a Git repository")?;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let result = (|| -> io::Result<()> {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(async {
-                    let viewer = doclify_viewer::Viewer::new(repo.worktree)?;
-                    let (url, task) = viewer.serve().await?;
-                    let _ = tx.send(url);
-                    task.await.map_err(io::Error::other)?
-                })
-            })();
-            if let Err(e) = result {
-                eprintln!("doclify viewer: {e}");
-            }
-        });
-        let url = rx.recv().map_err(|_| "viewer failed to start")?;
+        let (url, worker) = start_docs_viewer()?;
         println!("{}", json!({"url":url}));
         io::stdout().flush()?;
-        #[cfg(target_os = "macos")]
-        let opener = "open";
-        #[cfg(not(target_os = "macos"))]
-        let opener = "xdg-open";
-        let _ = std::process::Command::new(opener).arg(&url).spawn();
+        open_viewer(&url);
         if !background {
             let _ = worker.join();
         }
@@ -735,6 +718,36 @@ fn docs(background: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn start_docs_viewer(
+) -> Result<(String, std::thread::JoinHandle<()>), Box<dyn std::error::Error>> {
+    let repo = RepoInfo::discover(&std::env::current_dir()?).ok_or("not inside a Git repository")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = (|| -> io::Result<()> {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let viewer = doclify_viewer::Viewer::new(repo.worktree)?;
+                let (url, task) = viewer.serve().await?;
+                let _ = tx.send(url);
+                task.await.map_err(io::Error::other)?
+            })
+        })();
+        if let Err(e) = result {
+            eprintln!("doclify viewer: {e}");
+        }
+    });
+    let url = rx.recv().map_err(|_| "viewer failed to start")?;
+    Ok((url, worker))
+}
+
+fn open_viewer(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(url).spawn();
 }
 
 fn hook_status(worktree: &std::path::Path, agent: Agent) -> Value {
