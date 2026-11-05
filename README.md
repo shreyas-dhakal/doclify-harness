@@ -52,7 +52,22 @@ doclify init --model openai https://api.openai.com/v1 OPENAI_API_KEY your-model-
 
 ## Use
 
-Run `doclify` for the interactive prompt, or use the commands directly:
+Run `doclify` inside a Git repository to open the chat-first TUI. Describe in
+free text what the documentation should explain; Doclify drafts suggestions
+for review. Suggestions are not added to the docs until you approve them. Use
+`/review` to inspect pending suggestions, then accept, reject, or supersede each
+one. `/help` lists the chat commands. Other slash commands are `/sync` to
+import saved sessions, `/status` to see setup and pending work, `/handoff [topic]` to prepare approved
+project notes, `/docs` to open the docs in your
+browser, `/model` to choose an AI, and `/quit` to exit.
+
+The TUI shows these keyboard hints: Enter sends your message, Up/Down browse
+input history, Page Up/Page Down scroll the conversation, and Ctrl-C exits.
+Left/Right move the cursor; Home/End move it to the start/end of the input.
+Escape also exits when no operation is running. In the AI picker, Up/Down
+select a model, Enter chooses it, and Escape closes the picker.
+
+For scripts or direct terminal use, run the commands explicitly:
 
 ```sh
 doclify sync                    # capture sessions and update documentation
@@ -60,9 +75,9 @@ doclify status                  # inspect capture and review queues
 doclify unsupported             # inspect unsupported transcript details
 doclify unsupported replay      # retry them after an adapter or transcript update
 doclify review                  # list proposals
-doclify review <id> <version> accept
-doclify handoff "authentication" # get reviewed context for another session
-doclify docs                    # open the local viewer and editor
+doclify review <id> <version> accept   # approve a proposal (or reject/supersede)
+doclify handoff "authentication"      # get approved context for another session
+doclify docs                    # open the local docs viewer
 doclify metrics report          # inspect opt-in, local product measurements
 ```
 
