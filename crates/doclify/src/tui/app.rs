@@ -45,7 +45,7 @@ impl App {
             loading: true,
             messages: vec![Message {
                 role: "doclify",
-                text: "Tell me what the docs should explain. Type /help to see commands.".into(),
+                text: "Describe what the docs should explain. Free-text requests create proposals; approve them before they change docs. Type /help for commands.".into(),
             }],
             input: String::new(),
             cursor: 0,
@@ -230,7 +230,7 @@ pub fn run() -> io::Result<()> {
                             if first_load && snapshot.model.is_none() {
                                 app.messages.push(Message {
                                     role: "doclify",
-                                    text: "Choose an AI with /model, then describe what the docs should explain. Doclify will draft suggestions for you to review before adding them.".into(),
+                                    text: "Choose an AI with /model to get started.".into(),
                                 });
                             }
                             if first_load
