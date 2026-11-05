@@ -170,50 +170,91 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(conversation, area);
 }
 
-fn count(value: Option<usize>, description: &str) -> String {
-    value
-        .map(|number| format!("{number} {description}"))
-        .unwrap_or_else(|| "?".into())
+/// One workflow stage: pending work in its colour, settled stages muted, unknown counts as `?`.
+fn stage(
+    label: &'static str,
+    value: Option<usize>,
+    pending: &str,
+    settled: &str,
+    color: Color,
+    compact: bool,
+) -> Vec<Span<'static>> {
+    let (mark, detail, style) = match value {
+        None => ("?", "unknown".to_string(), Style::default().fg(MUTED)),
+        Some(0) => ("✓", settled.to_string(), Style::default().fg(MUTED)),
+        Some(number) => (
+            "●",
+            format!("{number} {pending}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    };
+    let detail = if compact {
+        match value {
+            Some(number) if number > 0 => number.to_string(),
+            _ => mark.to_string(),
+        }
+    } else {
+        format!("{mark} {detail}")
+    };
+    vec![
+        Span::styled(
+            format!("{label} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(detail, style),
+    ]
 }
 
 fn draw_flow(frame: &mut Frame, area: Rect, snapshot: Option<&WorkflowSnapshot>) {
-    let (capture, propose, review, docs) = snapshot
-        .map(|snapshot| {
-            (
-                count(snapshot.pending_capture_events, "new"),
-                count(snapshot.pending_extraction, "queued"),
-                count(snapshot.pending_review, "to review"),
-                count(snapshot.documentation_files, "files"),
-            )
-        })
-        .unwrap_or_else(|| ("?".into(), "?".into(), "?".into(), "?".into()));
-    let flow = Line::from(vec![
-        Span::styled(
-            format!(" IMPORT  {capture} "),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("›", Style::default().fg(MUTED)),
-        Span::styled(
-            format!(" DRAFTS  {propose} "),
-            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("›", Style::default().fg(MUTED)),
-        Span::styled(
-            format!(" REVIEW  {review} "),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("›", Style::default().fg(MUTED)),
-        Span::styled(
-            format!(" DOCS  {docs} "),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
+    let compact = area.width < 96;
+    let value = |field: fn(&WorkflowSnapshot) -> Option<usize>| snapshot.and_then(field);
+    // Docs has no pending state: files present means ready, zero means nothing written yet.
+    let docs = match (value(|snapshot| snapshot.documentation_files), compact) {
+        (None, _) => Span::styled("?", Style::default().fg(MUTED)),
+        (Some(0), true) => Span::styled("0", Style::default().fg(MUTED)),
+        (Some(0), false) => Span::styled("none yet", Style::default().fg(MUTED)),
+        (Some(number), true) => Span::styled(number.to_string(), Style::default().fg(TEXT)),
+        (Some(number), false) => {
+            Span::styled(format!("{number} files ready"), Style::default().fg(TEXT))
+        }
+    };
+    let separator = || Span::styled(" → ", Style::default().fg(MUTED));
+    let mut spans = stage(
+        "Capture",
+        value(|snapshot| snapshot.pending_capture_events),
+        "to import",
+        "clear",
+        ACCENT,
+        compact,
+    );
+    spans.push(separator());
+    spans.extend(stage(
+        "Propose",
+        value(|snapshot| snapshot.pending_extraction),
+        "to draft",
+        "clear",
+        BLUE,
+        compact,
+    ));
+    spans.push(separator());
+    spans.extend(stage(
+        "Review",
+        value(|snapshot| snapshot.pending_review),
+        "waiting",
+        "clear",
+        Color::Yellow,
+        compact,
+    ));
+    spans.push(separator());
+    spans.push(Span::styled(
+        "Docs ",
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(docs);
     frame.render_widget(
-        Paragraph::new(flow).block(
+        Paragraph::new(Line::from(spans)).block(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(Style::default().fg(Color::Rgb(47, 58, 74)))
